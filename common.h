@@ -13,8 +13,12 @@
 enum message_type {
     MSG_CONNECT = 0x01,
     MSG_CONNECT_RESULT = 0x02,
+    MSG_RECONNECT = 0x03,
+    MSG_RECONNECT_RESULT = 0x04,
     MSG_LIST_ROOMS = 0x05,
     MSG_ROOM_LIST = 0x06,
+    MSG_CREATE_ROOM = 0x07,
+    MSG_CREATE_ROOM_RESULT = 0x08,
     MSG_ERROR = 0x14
 };
 

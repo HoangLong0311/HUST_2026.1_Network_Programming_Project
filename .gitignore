@@ -1,1 +1,6 @@
-README.md
+server
+client
+tests/test_protocol
+tests/test_auction_state
+tests/test_server_integration
+*.o
