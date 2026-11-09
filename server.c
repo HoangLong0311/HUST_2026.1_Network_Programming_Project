@@ -1,4 +1,5 @@
 #include "auction_state.h"
+#include "logger.h"
 #include "protocol.h"
 
 #include <arpa/inet.h>
@@ -7,8 +8,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+#define MAX_CLIENTS 64U
+#define INPUT_BUFFER_SIZE (PROTOCOL_HEADER_SIZE + PROTOCOL_MAX_PAYLOAD) * 2U
+
+static struct logger server_logger;
 
 static int send_payload(int socket_fd, uint8_t type, uint32_t request_id,
                         const void *payload, size_t payload_length)
@@ -24,7 +32,12 @@ static int send_payload(int socket_fd, uint8_t type, uint32_t request_id,
     header.request_id = request_id;
     header.payload_length = (uint32_t)payload_length;
     header.reserved = 0;
-    return send_message(socket_fd, &header, payload);
+    if (send_message(socket_fd, &header, payload) != PROTOCOL_OK) {
+        logger_event(&server_logger, "ERROR", "send_message failed");
+        return PROTOCOL_ERROR;
+    }
+    logger_message(&server_logger, "SEND", &header, payload);
+    return PROTOCOL_OK;
 }
 
 static int send_text(int socket_fd, uint8_t type, uint32_t request_id,
@@ -251,65 +264,140 @@ static int handle_create_room(int socket_fd, const struct message *message,
                      message->header.request_id, payload);
 }
 
-static int handle_client(int client_fd, struct auction_state *state)
+struct client_connection {
+    int socket_fd;
+    size_t input_length;
+    uint8_t input[INPUT_BUFFER_SIZE];
+    struct participant *participant;
+};
+
+static int process_message(struct client_connection *client,
+                           const struct message *message,
+                           struct auction_state *state)
 {
-    struct participant *current_participant = NULL;
-    int status = 0;
+    int response_result;
 
-    for (;;) {
-        struct message message = {0};
-        int receive_result = recv_message(client_fd, &message);
-        int response_result;
-
-        if (receive_result == PROTOCOL_DISCONNECT) {
-            printf("Client da ngat ket noi.\n");
-            break;
+    logger_message(&server_logger, "RECV", &message->header, message->payload);
+    switch (message->header.type) {
+    case MSG_CONNECT:
+        response_result = handle_connect(client->socket_fd, message, state,
+                                         &client->participant);
+        break;
+    case MSG_RECONNECT:
+        response_result = handle_reconnect(client->socket_fd, message, state,
+                                           &client->participant);
+        break;
+    case MSG_LIST_ROOMS:
+        if (client->participant == NULL) {
+            response_result = send_error(client->socket_fd,
+                                         message->header.request_id,
+                                         "NOT_CONNECTED");
+        } else if (message->header.payload_length != 0U) {
+            response_result = send_error(client->socket_fd,
+                                         message->header.request_id,
+                                         "UNEXPECTED_PAYLOAD");
+        } else {
+            response_result = send_room_list(client->socket_fd,
+                                             message->header.request_id, state);
         }
-        if (receive_result != PROTOCOL_OK) {
-            fprintf(stderr, "Protocol error: header hoac payload khong hop le.\n");
-            status = -1;
-            break;
-        }
-
-        switch (message.header.type) {
-        case MSG_CONNECT:
-            response_result = handle_connect(client_fd, &message, state,
-                                             &current_participant);
-            break;
-        case MSG_RECONNECT:
-            response_result = handle_reconnect(client_fd, &message, state,
-                                               &current_participant);
-            break;
-        case MSG_LIST_ROOMS:
-            if (current_participant == NULL) {
-                response_result = send_error(client_fd, message.header.request_id,
-                                             "NOT_CONNECTED");
-            } else if (message.header.payload_length != 0U) {
-                response_result = send_error(client_fd, message.header.request_id,
-                                             "UNEXPECTED_PAYLOAD");
-            } else {
-                response_result = send_room_list(client_fd,
-                                                 message.header.request_id, state);
-            }
-            break;
-        case MSG_CREATE_ROOM:
-            response_result = handle_create_room(client_fd, &message, state,
-                                                 current_participant);
-            break;
-        default:
-            response_result = send_error(client_fd, message.header.request_id,
-                                         "UNKNOWN_MESSAGE_TYPE");
-            break;
-        }
-
-        if (response_result != PROTOCOL_OK) {
-            status = -1;
-            break;
-        }
+        break;
+    case MSG_CREATE_ROOM:
+        response_result = handle_create_room(client->socket_fd, message, state,
+                                             client->participant);
+        break;
+    default:
+        response_result = send_error(client->socket_fd,
+                                     message->header.request_id,
+                                     "UNKNOWN_MESSAGE_TYPE");
+        break;
     }
 
-    participant_disconnect(current_participant);
-    return status;
+    return response_result;
+}
+
+static int process_input(struct client_connection *client,
+                         struct auction_state *state)
+{
+    while (client->input_length >= PROTOCOL_HEADER_SIZE) {
+        struct message message = {0};
+        struct message_header header;
+        size_t frame_length;
+
+        if (decode_header(client->input, &header) != PROTOCOL_OK) {
+            logger_event(&server_logger, "ERROR",
+                         "invalid frame header; closing client");
+            return -1;
+        }
+        frame_length = PROTOCOL_HEADER_SIZE + header.payload_length;
+        if (client->input_length < frame_length) {
+            return 0;
+        }
+        message.header = header;
+        if (header.payload_length > 0) {
+            memcpy(message.payload, client->input + PROTOCOL_HEADER_SIZE,
+                   header.payload_length);
+        }
+        client->input_length -= frame_length;
+        if (client->input_length > 0) {
+            memmove(client->input, client->input + frame_length,
+                    client->input_length);
+        }
+        if (process_message(client, &message, state) != PROTOCOL_OK) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int read_client(struct client_connection *client,
+                        struct auction_state *state)
+{
+    for (;;) {
+        ssize_t received;
+
+        if (client->input_length == sizeof(client->input)) {
+            logger_event(&server_logger, "ERROR",
+                         "client input buffer exhausted");
+            return -1;
+        }
+        received = recv(client->socket_fd,
+                        client->input + client->input_length,
+                        sizeof(client->input) - client->input_length,
+                        MSG_DONTWAIT);
+        if (received > 0) {
+            client->input_length += (size_t)received;
+            if (process_input(client, state) != 0) {
+                return -1;
+            }
+            continue;
+        }
+        if (received == 0) {
+            if (client->input_length != 0) {
+                logger_event(&server_logger, "ERROR",
+                             "client disconnected during frame");
+            }
+            return 1;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return 0;
+        }
+        logger_event(&server_logger, "ERROR", "client recv failed");
+        return -1;
+    }
+}
+
+static void close_client(struct client_connection *client)
+{
+    if (client->socket_fd >= 0) {
+        close(client->socket_fd);
+    }
+    participant_disconnect(client->participant);
+    client->socket_fd = -1;
+    client->input_length = 0;
+    client->participant = NULL;
 }
 
 static int parse_port(const char *value, uint16_t *port)
@@ -331,6 +419,9 @@ int main(int argc, char *argv[])
 {
     int server_fd;
     int option = 1;
+    struct pollfd poll_fds[MAX_CLIENTS + 1U];
+    struct client_connection clients[MAX_CLIENTS] = {0};
+    size_t client_count = 0;
     uint16_t server_port = SERVER_PORT;
     struct auction_state state;
     struct sockaddr_in server_address;
@@ -345,18 +436,30 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
+    if (logger_open(&server_logger, "auction.log", "SERVER") != 0) {
+        perror("auction.log");
+        return EXIT_FAILURE;
+    }
     signal(SIGPIPE, SIG_IGN);
     auction_state_init(&state);
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
         perror("socket");
+        logger_close(&server_logger);
         return EXIT_FAILURE;
     }
     if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &option,
                    sizeof(option)) < 0) {
         perror("setsockopt");
         close(server_fd);
+        logger_close(&server_logger);
+        return EXIT_FAILURE;
+    }
+    if (fcntl(server_fd, F_SETFL, O_NONBLOCK) < 0) {
+        perror("fcntl");
+        close(server_fd);
+        logger_close(&server_logger);
         return EXIT_FAILURE;
     }
 
@@ -369,6 +472,7 @@ int main(int argc, char *argv[])
         listen(server_fd, 5) < 0) {
         perror("bind/listen");
         close(server_fd);
+        logger_close(&server_logger);
         return EXIT_FAILURE;
     }
 
@@ -379,6 +483,7 @@ int main(int argc, char *argv[])
                         &address_length) < 0) {
             perror("getsockname");
             close(server_fd);
+            logger_close(&server_logger);
             return EXIT_FAILURE;
         }
         server_port = ntohs(server_address.sin_port);
@@ -387,19 +492,78 @@ int main(int argc, char *argv[])
     printf("Server dang lang nghe tai port %u...\n", (unsigned int)server_port);
     fflush(stdout);
     for (;;) {
-        int client_fd = accept(server_fd, NULL, NULL);
+        size_t index;
+        int ready;
 
-        if (client_fd < 0) {
+        poll_fds[0].fd = server_fd;
+        poll_fds[0].events = POLLIN;
+        poll_fds[0].revents = 0;
+        for (index = 0; index < client_count; index++) {
+            poll_fds[index + 1U].fd = clients[index].socket_fd;
+            poll_fds[index + 1U].events = POLLIN;
+            poll_fds[index + 1U].revents = 0;
+        }
+
+        ready = poll(poll_fds, client_count + 1U, -1);
+        if (ready < 0) {
             if (errno == EINTR) {
                 continue;
             }
-            perror("accept");
-            close(server_fd);
-            return EXIT_FAILURE;
+            perror("poll");
+            break;
         }
-        printf("Client da ket noi.\n");
-        fflush(stdout);
-        (void)handle_client(client_fd, &state);
-        close(client_fd);
+
+        if (poll_fds[0].revents & POLLIN) {
+            for (;;) {
+                int client_fd = accept(server_fd, NULL, NULL);
+
+                if (client_fd < 0) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        break;
+                    }
+                    perror("accept");
+                    break;
+                }
+                if (client_count == MAX_CLIENTS) {
+                    logger_event(&server_logger, "WARN",
+                                 "client limit reached; connection rejected");
+                    close(client_fd);
+                    continue;
+                }
+                clients[client_count].socket_fd = client_fd;
+                clients[client_count].input_length = 0;
+                clients[client_count].participant = NULL;
+                client_count++;
+                printf("Client da ket noi (%zu/%u).\n", client_count,
+                       MAX_CLIENTS);
+                fflush(stdout);
+            }
+        }
+
+        for (index = client_count; index > 0; index--) {
+            size_t client_index = index - 1U;
+            short events = poll_fds[client_index + 1U].revents;
+
+            if (events & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) {
+                int result = read_client(&clients[client_index], &state);
+
+                if (result != 0) {
+                    close_client(&clients[client_index]);
+                    clients[client_index] = clients[client_count - 1U];
+                    client_count--;
+                }
+            }
+        }
     }
+
+    while (client_count > 0) {
+        close_client(&clients[client_count - 1U]);
+        client_count--;
+    }
+    close(server_fd);
+    logger_close(&server_logger);
+    return EXIT_FAILURE;
 }
