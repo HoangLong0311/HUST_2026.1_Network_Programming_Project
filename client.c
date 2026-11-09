@@ -1,4 +1,5 @@
 #include "auction_state.h"
+#include "logger.h"
 #include "protocol.h"
 
 #include <arpa/inet.h>
@@ -8,6 +9,8 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+static struct logger client_logger;
 
 static int is_safe_text(const char *text, size_t maximum_length, int allow_empty)
 {
@@ -41,7 +44,12 @@ static int send_request(int socket_fd, uint8_t type, uint32_t request_id,
     header.request_id = request_id;
     header.payload_length = (uint32_t)payload_length;
     header.reserved = 0;
-    return send_message(socket_fd, &header, payload);
+    if (send_message(socket_fd, &header, payload) != PROTOCOL_OK) {
+        logger_event(&client_logger, "ERROR", "send_message failed");
+        return PROTOCOL_ERROR;
+    }
+    logger_message(&client_logger, "SEND", &header, payload);
+    return PROTOCOL_OK;
 }
 
 static void print_payload(const struct message *message)
@@ -57,9 +65,11 @@ static int receive_response(int socket_fd, uint32_t request_id,
     struct message response;
 
     if (recv_message(socket_fd, &response) != PROTOCOL_OK) {
+        logger_event(&client_logger, "ERROR", "receive frame failed");
         fprintf(stderr, "Khong the nhan phan hoi tu server.\n");
         return -1;
     }
+    logger_message(&client_logger, "RECV", &response.header, response.payload);
     if (response.header.request_id != request_id) {
         fprintf(stderr, "request_id phan hoi khong khop.\n");
         return -1;
@@ -148,9 +158,14 @@ int main(int argc, char *argv[])
     }
 
     signal(SIGPIPE, SIG_IGN);
+    if (logger_open(&client_logger, "auction.log", "CLIENT") != 0) {
+        perror("auction.log");
+        return EXIT_FAILURE;
+    }
     socket_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (socket_fd < 0) {
         perror("socket");
+        logger_close(&client_logger);
         return EXIT_FAILURE;
     }
 
@@ -162,6 +177,7 @@ int main(int argc, char *argv[])
                 sizeof(server_address)) < 0) {
         perror("connect");
         close(socket_fd);
+        logger_close(&client_logger);
         return EXIT_FAILURE;
     }
 
@@ -173,6 +189,7 @@ int main(int argc, char *argv[])
                                           : "RECONNECT_RESULT");
     if (request_result != 0) {
         close(socket_fd);
+        logger_close(&client_logger);
         return EXIT_FAILURE;
     }
 
@@ -213,10 +230,12 @@ int main(int argc, char *argv[])
 
         if (request_result < 0) {
             close(socket_fd);
+            logger_close(&client_logger);
             return EXIT_FAILURE;
         }
     }
 
     close(socket_fd);
+    logger_close(&client_logger);
     return EXIT_SUCCESS;
 }

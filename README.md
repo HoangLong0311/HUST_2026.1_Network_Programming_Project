@@ -1,51 +1,88 @@
-# Online Auction — G3 & G4
+# Online Auction - G3 & G4
 
-Triển khai này mở rộng TCP Protocol V1 của G2 với:
+Đây là chương trình TCP socket bằng C trên Linux, biên dịch bằng GCC. Bản
+hiện tại mở rộng Protocol V1 với:
 
 - **G3:** participant, `CONNECT`, session token và `RECONNECT`.
-- **G4:** danh sách nhiều phòng đấu giá trong bộ nhớ và tạo phòng mới.
+- **G4:** danh sách phòng đấu giá trong bộ nhớ và `CREATE_ROOM`.
 
-Phần này chưa làm `JOIN`/`LEAVE`, đặt giá, timer hoặc phục vụ đồng thời nhiều
-client; các nội dung đó thuộc G5–G9.
+Chưa triển khai `JOIN`/`LEAVE`, đặt giá, timer, lưu dữ liệu lâu dài hoặc
+multithreading. Server dùng `poll()` để phục vụ nhiều client trong một tiến
+trình; mỗi request vẫn được xử lý tuần tự trong event loop.
+
+## Cấu trúc mã nguồn
+
+- `common.h`: hằng số protocol, port và message type.
+- `protocol.h`, `protocol.c`: đóng gói/giải mã frame TCP và xử lý partial
+  I/O.
+- `auction_state.h`, `auction_state.c`: quản lý participant, token và phòng
+  trong bộ nhớ.
+- `server.c`: socket server, xác thực request và điều phối state.
+- `client.c`: client tương tác dòng lệnh, hỗ trợ connect/reconnect và các lệnh
+  phòng.
+- `logger.h`, `logger.c`: log append-only cho message gửi/nhận và sự kiện lỗi.
+- `Makefile`: build chương trình và test.
+- `tests/`: test protocol, state và server integration.
 
 ## Biên dịch và kiểm thử
 
-Project dùng POSIX sockets, vì vậy hãy chạy trên Linux hoặc WSL có `gcc` và
-`make` (ví dụ: `sudo apt install build-essential`).
+Yêu cầu Linux hoặc WSL có `gcc` và `make`:
 
 ```bash
 make
 make test
 ```
 
-Các lệnh `make server`, `make client` và `make clean` cũng được hỗ trợ.
+Các target riêng:
 
-## Chạy
+```bash
+make server
+make client
+make clean
+```
 
-Mở hai terminal trong thư mục project:
+`make test` biên dịch và chạy:
+
+1. test encode/decode và round-trip frame;
+2. test tạo participant, disconnect/reconnect, token và phòng;
+3. test server thật, quyền truy cập trước `CONNECT`, request ID, reconnect,
+   tạo phòng và liệt kê phòng.
+
+## Chạy chương trình
+
+Terminal 1:
 
 ```bash
 ./server
+```
+
+Server mặc định lắng nghe TCP port `8080`. Có thể truyền port khác để chạy
+integration test độc lập:
+
+```bash
+./server 25000
+```
+
+Terminal 2:
+
+```bash
 ./client Alice
 ```
 
-Client sẽ in kết quả dạng sau. Lưu lại participant ID và token để reconnect.
+Client kết nối tới `127.0.0.1:8080`, gửi `CONNECT` và in kết quả:
 
 ```text
 CONNECT_RESULT: OK|P001|<session-token>
 ```
 
-Sau khi client đầu tiên thoát, server vẫn giữ participant trong bộ nhớ. Dùng
-lệnh sau để nối lại phiên đó:
+Lưu `participant ID` và `session-token` để reconnect sau khi client đóng
+socket:
 
 ```bash
 ./client --reconnect P001 <session-token>
 ```
 
-`RECONNECT_RESULT` trả lại cùng token. Giữ token này để có thể kết nối lại
-ngay cả khi phản hồi bị mất do mạng gián đoạn.
-
-Trong client đã kết nối, các lệnh hiện có là:
+Trong phiên đã kết nối, các lệnh được hỗ trợ:
 
 ```text
 LIST_ROOMS
@@ -53,65 +90,112 @@ CREATE_ROOM Sunday Auction
 exit
 ```
 
-Server tạo sẵn hai phòng `R001` và `R002`; mỗi `CREATE_ROOM` hợp lệ tạo phòng
-mới với ID tăng dần. Dữ liệu participant, token và phòng sẽ mất khi server
-khởi động lại.
+Server khởi tạo sẵn `R001|Demo Room` và `R002|Practice Room`. Mỗi phòng mới
+được cấp ID tăng dần; tên phòng trùng bị từ chối. Participant, token và phòng
+chỉ tồn tại trong bộ nhớ và mất khi server khởi động lại.
 
-`./server` dùng port `8080` mặc định. Server cũng nhận một đối số port tùy chọn
-cho integration test độc lập (ví dụ `./server 25000`); client CLI mặc định vẫn
-kết nối port `8080`.
+## Log giao tiếp
+
+Server và client cùng ghi append vào file `auction.log` tại thư mục hiện tại.
+Mỗi dòng log gồm:
+
+- timestamp ISO-8601 và process ID;
+- `component` (`SERVER` hoặc `CLIENT`);
+- `direction` (`SEND` hoặc `RECV`);
+- message type và mã hex;
+- `request_id`;
+- độ dài payload;
+- payload dạng text đã escape (`\n`, `\r`, `\xNN`, dấu nháy).
+
+Ví dụ:
+
+```text
+time=2026-11-09T15:20:00+0700 pid=1234 component=CLIENT direction=SEND type=LIST_ROOMS(0x05) request_id=2 payload_len=0 payload=""
+```
+
+File được mở ở chế độ append và flush sau mỗi dòng để giữ log khi chương
+trình đang chạy. Payload của `RECONNECT` và `RECONNECT_RESULT` được che token
+thành `<REDACTED>`; không nên ghi credential đầy đủ vào log. Lỗi gửi/nhận và
+frame không hợp lệ cũng được ghi với `level=ERROR`.
+
+`auction.log` là dữ liệu runtime, không phải source code; có thể xóa trước một
+lần chạy mới nếu muốn log riêng:
+
+```bash
+rm -f auction.log
+```
 
 ## Protocol V1
 
-Mỗi message có header 16 byte, theo thứ tự byte:
+Mỗi message gồm header 16 byte và payload từ 0 đến 4096 byte:
 
 ```text
 magic (2) | version (1) | type (1) | request_id (4) |
 payload_length (4) | reserved (4)
 ```
 
-Các số nhiều byte dùng big-endian. Payload không có NUL terminator, tối đa
-4096 byte. `protocol.c` xử lý partial `send`/`recv`, `EINTR`, disconnect và
-kiểm tra `magic`, `version`, `reserved`, giới hạn payload.
+- `magic = 0x4155` (`AU`);
+- `version = 1`;
+- các số nhiều byte dùng big-endian;
+- `reserved` luôn bằng `0`;
+- payload không có NUL terminator;
+- không gửi trực tiếp `struct C` qua socket.
 
-| Type | Mã | Request payload | Response payload |
+`send_all()` và `recv_exact()` xử lý partial send/receive, `EINTR` và
+disconnect. `decode_header()` từ chối magic, version, reserved hoặc
+`payload_length` không hợp lệ. Nếu frame hỏng hoặc payload bị ngắt giữa chừng,
+server ghi lỗi và đóng kết nối; server không cố trả `ERROR` bằng một header
+không đáng tin cậy.
+
+## Message type và payload
+
+| Message | Mã | Request payload | Response |
 |---|---:|---|---|
-| `CONNECT` | `0x01` | rỗng hoặc tên participant | `CONNECT_RESULT`: `OK|<participant-id>|<token>` |
-| `RECONNECT` | `0x03` | `<participant-id>|<token>` | `RECONNECT_RESULT`: `OK|<participant-id>|<token>` |
-| `LIST_ROOMS` | `0x05` | rỗng | `ROOM_LIST`: mỗi dòng là `<room-id>|<room-name>` |
-| `CREATE_ROOM` | `0x07` | tên phòng | `CREATE_ROOM_RESULT`: `OK|<room-id>|<room-name>` |
-| `ERROR` | `0x14` | — | mã lỗi dạng text, echo `request_id` |
+| `CONNECT` | `0x01` | Tên participant hoặc rỗng | `CONNECT_RESULT` |
+| `CONNECT_RESULT` | `0x02` | — | `OK|<participant-id>|<token>` |
+| `RECONNECT` | `0x03` | `<participant-id>\|<token>` | `RECONNECT_RESULT` |
+| `RECONNECT_RESULT` | `0x04` | — | `OK|<participant-id>|<token>` |
+| `LIST_ROOMS` | `0x05` | Rỗng | `ROOM_LIST` |
+| `ROOM_LIST` | `0x06` | — | Mỗi dòng `<room-id>|<room-name>` |
+| `CREATE_ROOM` | `0x07` | Tên phòng | `CREATE_ROOM_RESULT` |
+| `CREATE_ROOM_RESULT` | `0x08` | — | `OK|<room-id>|<room-name>` |
+| `ERROR` | `0x14` | — | Mã lỗi dạng text |
 
-Tên participant/tên phòng phải là ASCII in được, dài trong giới hạn của source
-code, và không được chứa `|`, CR hoặc LF. Session token là credential của phiên:
-không chia sẻ token cho người khác. Đây là raw TCP không có TLS và client nhận
-token qua command line khi reconnect, nên chỉ dùng cho thực hành cục bộ; không
-phải cơ chế xác thực production.
+Mọi response ứng với request đều echo đúng `request_id`. Message tự gửi
+không có trong phiên bản hiện tại; nếu có thì dùng `request_id = 0`.
 
-## Thiết kế G3/G4
+Các mã lỗi chính gồm:
 
-- `auction_state.c` quản lý tối đa 64 participant và 32 phòng.
-- Participant không bị xoá khi ngắt kết nối để có thể reconnect. Sau 64 lần
-  `CONNECT` tạo participant mới, server từ chối participant mới cho đến khi
-  khởi động lại; kết nối lại participant cũ vẫn được hỗ trợ.
-- `CONNECT` cấp ID theo dạng `P001`, token 32 ký tự hex và đánh dấu participant
-  đang kết nối.
-- Khi socket đóng, participant được chuyển offline nhưng không bị xoá;
-  `RECONNECT` hợp lệ dùng lại đúng participant đó.
-- Mỗi phòng có ID `R001`..., tên và participant tạo phòng. Tên phòng trùng bị
-  từ chối để danh sách không mơ hồ.
-- Server vẫn tuần tự theo phạm vi trước G9; state được giữ qua các kết nối nối
-  tiếp trong cùng một tiến trình server. Một client gửi dở header/payload có thể
-  giữ server chờ; G9 sẽ thay bằng cơ chế phục vụ nhiều client đồng thời.
-- Token chỉ tồn tại trong bộ nhớ và được tạo từ `/dev/urandom`. Token chưa có
-  thời hạn và không được thay mới, nên chỉ phù hợp cho bài thực hành local.
+- `NOT_CONNECTED`
+- `ALREADY_CONNECTED`
+- `INVALID_PARTICIPANT_NAME`
+- `INVALID_RECONNECT`
+- `PARTICIPANT_LIMIT_REACHED`
+- `ROOM_LIMIT_REACHED`
+- `ROOM_NAME_EXISTS`
+- `INVALID_ROOM_NAME`
+- `UNEXPECTED_PAYLOAD`
+- `UNKNOWN_MESSAGE_TYPE`
+- `INTERNAL_ERROR`
 
-## Kiểm thử
+Tên participant và tên phòng phải là ASCII in được, không chứa `|`, CR hoặc
+LF, và phải nằm trong giới hạn buffer được định nghĩa ở `auction_state.h`.
 
-`make test` chạy:
+## Giới hạn và lưu ý bảo mật
 
-- `tests/test_protocol.c`: header, encode/decode và round-trip frame.
-- `tests/test_auction_state.c`: CONNECT, disconnect/reconnect, token sai và
-  nhiều phòng/ID phòng.
-- `tests/test_server_integration.c`: server thật, phân quyền trước CONNECT,
-  RECONNECT hợp lệ/không hợp lệ, echo `request_id`, tạo và liệt kê phòng.
+- Tối đa 64 participant và 32 phòng trong một tiến trình.
+- Participant offline không bị xóa để hỗ trợ reconnect; khi đạt giới hạn
+  participant mới, server từ chối participant mới cho tới khi restart.
+- Token 32 ký tự hex được tạo từ `/dev/urandom`, chỉ giữ trong RAM và không có
+  thời hạn.
+- Log có thể chứa tên participant, tên phòng và payload ứng dụng; cần bảo vệ
+  quyền đọc file log. Token reconnect được redacted nhưng log vẫn có thể chứa
+  dữ liệu hoạt động.
+- Đây là TCP raw, không có TLS. Token là credential của phiên, chỉ phù hợp
+  cho bài thực hành local, không phải cơ chế xác thực production.
+- Server dùng `poll()` và buffer riêng cho từng client, nên một client gửi dở
+  frame không chặn các client khác. Một lần `recv()` có thể chứa nhiều frame;
+  server tách và xử lý lần lượt từng frame hoàn chỉnh.
+- Giới hạn hiện tại là 64 client đồng thời; kết nối vượt giới hạn bị từ chối.
+- Chưa có multithreading. Payload phản hồi tối đa 4096 byte được gửi đồng bộ;
+  ứng dụng tải lớn hơn cần thêm output queue và theo dõi `POLLOUT`.
