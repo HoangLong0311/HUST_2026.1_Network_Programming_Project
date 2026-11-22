@@ -1,4 +1,5 @@
 #include "auction_state.h"
+#include "auction.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -127,11 +128,56 @@ static void test_join_leave_membership(void)
     assert(auction_room_join(&state, alice, "R001") == STATE_ROOM_FULL);
 }
 
+static void test_auction_bids(void)
+{
+    struct auction_state state;
+    struct participant *alice;
+    struct participant *bob;
+    struct auction_room *room;
+    int64_t minimum;
+
+    auction_state_init(&state);
+    assert(participant_connect(&state, "Alice", &alice) == STATE_OK);
+    assert(participant_connect(&state, "Bob", &bob) == STATE_OK);
+    room = auction_room_find(&state, "R001");
+    assert(room != NULL);
+    assert(auction_room_join(&state, alice, "R001") == STATE_OK);
+    assert(auction_room_join(&state, bob, "R001") == STATE_OK);
+
+    assert(auction_place_bid(room, alice->id, 100000, &minimum) ==
+           AUCTION_BID_OK);
+    assert(room->current_price == 100000);
+    assert(strcmp(room->highest_bidder_id, "P001") == 0);
+    assert(room->bid_count == 1U);
+
+    assert(auction_place_bid(room, bob->id, 109999, &minimum) ==
+           AUCTION_BID_PRICE_TOO_LOW);
+    assert(minimum == 110000);
+    assert(room->current_price == 100000);
+    assert(room->bid_count == 1U);
+
+    assert(auction_place_bid(room, bob->id, 160000, &minimum) ==
+           AUCTION_BID_OK);
+    assert(room->current_price == 160000);
+    assert(strcmp(room->highest_bidder_id, "P002") == 0);
+    assert(room->bid_count == 2U);
+
+    assert(auction_place_bid(room, alice->id, 0, &minimum) ==
+           AUCTION_BID_INVALID_AMOUNT);
+    assert(auction_place_bid(room, alice->id, -100, &minimum) ==
+           AUCTION_BID_INVALID_AMOUNT);
+
+    room->auction_status = AUCTION_WAITING;
+    assert(auction_place_bid(room, alice->id, 170000, &minimum) ==
+           AUCTION_BID_NOT_ACTIVE);
+}
+
 int main(void)
 {
     test_connect_disconnect_and_reconnect();
     test_multiple_rooms_are_managed_in_memory();
     test_join_leave_membership();
+    test_auction_bids();
     puts("auction state tests passed");
     return 0;
 }
