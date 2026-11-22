@@ -19,6 +19,12 @@ enum message_type {
     MSG_ROOM_LIST = 0x06,
     MSG_CREATE_ROOM = 0x07,
     MSG_CREATE_ROOM_RESULT = 0x08,
+    MSG_JOIN_ROOM = 0x09,
+    MSG_JOIN_RESULT = 0x0A,
+    MSG_LEAVE_ROOM = 0x0B,
+    MSG_LEAVE_RESULT = 0x0C,
+    MSG_GET_ROOM_STATE = 0x0D,
+    MSG_ROOM_STATE = 0x0E,
     MSG_ERROR = 0x14
 };
 

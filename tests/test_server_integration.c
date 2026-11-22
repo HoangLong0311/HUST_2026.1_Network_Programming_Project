@@ -215,6 +215,8 @@ int main(void)
     char token[SESSION_TOKEN_CAPACITY];
     char reconnect_payload[PARTICIPANT_ID_CAPACITY + SESSION_TOKEN_CAPACITY];
     int socket_fd = -1;
+    int second_socket = -1;
+    int third_socket = -1;
     int server_output = -1;
     int exit_status = EXIT_FAILURE;
     uint16_t test_port = 0;
@@ -287,11 +289,73 @@ int main(void)
     CHECK(receive_response(socket_fd, 9U, MSG_ROOM_LIST, response));
     CHECK(strstr(response, "R003|Sunday Auction\n") != NULL);
 
+    CHECK(send_request(socket_fd, MSG_JOIN_ROOM, 10U, "R999"));
+    CHECK(receive_response(socket_fd, 10U, MSG_JOIN_RESULT, response));
+    CHECK(strcmp(response, "FAIL|ROOM_NOT_FOUND") == 0);
+
+    CHECK(send_request(socket_fd, MSG_JOIN_ROOM, 11U, "R001"));
+    CHECK(receive_response(socket_fd, 11U, MSG_JOIN_RESULT, response));
+    CHECK(strcmp(response, "OK|R001") == 0);
+    CHECK(receive_response(socket_fd, 11U, MSG_ROOM_STATE, response));
+    CHECK(strstr(response, "R001|Demo Room|OPEN|P001|1") != NULL);
+
+    CHECK(send_request(socket_fd, MSG_JOIN_ROOM, 12U, "R002"));
+    CHECK(receive_response(socket_fd, 12U, MSG_JOIN_RESULT, response));
+    CHECK(strcmp(response, "FAIL|ALREADY_IN_ROOM") == 0);
+
+    CHECK(send_request(socket_fd, MSG_LEAVE_ROOM, 13U, "R002"));
+    CHECK(receive_response(socket_fd, 13U, MSG_LEAVE_RESULT, response));
+    CHECK(strcmp(response, "FAIL|ROOM_MISMATCH") == 0);
+
+    CHECK(send_request(socket_fd, MSG_GET_ROOM_STATE, 14U, "R001"));
+    CHECK(receive_response(socket_fd, 14U, MSG_ROOM_STATE, response));
+    CHECK(strstr(response, "P001|1") != NULL);
+
+    CHECK(send_request(socket_fd, MSG_LEAVE_ROOM, 15U, "R001"));
+    CHECK(receive_response(socket_fd, 15U, MSG_LEAVE_RESULT, response));
+    CHECK(strcmp(response, "OK|R001") == 0);
+    CHECK(receive_response(socket_fd, 15U, MSG_ROOM_STATE, response));
+    CHECK(strstr(response, "R001|Demo Room|OPEN||0") != NULL);
+
+    second_socket = connect_to_server(test_port, server_process);
+    CHECK(second_socket >= 0);
+    CHECK(send_request(second_socket, MSG_CONNECT, 16U, "Bob"));
+    CHECK(receive_response(second_socket, 16U, MSG_CONNECT_RESULT, response));
+    CHECK(send_request(second_socket, MSG_JOIN_ROOM, 17U, "R001"));
+    CHECK(receive_response(second_socket, 17U, MSG_JOIN_RESULT, response));
+    CHECK(strcmp(response, "OK|R001") == 0);
+    CHECK(receive_response(second_socket, 17U, MSG_ROOM_STATE, response));
+    CHECK(strstr(response, "P002") != NULL);
+
+    third_socket = connect_to_server(test_port, server_process);
+    CHECK(third_socket >= 0);
+    CHECK(send_request(third_socket, MSG_CONNECT, 18U, "Carol"));
+    CHECK(receive_response(third_socket, 18U, MSG_CONNECT_RESULT, response));
+    CHECK(send_request(third_socket, MSG_JOIN_ROOM, 19U, "R002"));
+    CHECK(receive_response(third_socket, 19U, MSG_JOIN_RESULT, response));
+    CHECK(strcmp(response, "OK|R002") == 0);
+    CHECK(receive_response(third_socket, 19U, MSG_ROOM_STATE, response));
+    CHECK(strstr(response, "P003") != NULL);
+
+    CHECK(send_request(socket_fd, MSG_JOIN_ROOM, 20U, "R002"));
+    CHECK(receive_response(socket_fd, 20U, MSG_JOIN_RESULT, response));
+    CHECK(strcmp(response, "OK|R002") == 0);
+    CHECK(receive_response(socket_fd, 20U, MSG_ROOM_STATE, response));
+    CHECK(send_request(socket_fd, MSG_JOIN_ROOM, 21U, "R001"));
+    CHECK(receive_response(socket_fd, 21U, MSG_JOIN_RESULT, response));
+    CHECK(strcmp(response, "FAIL|ALREADY_IN_ROOM") == 0);
+
     exit_status = EXIT_SUCCESS;
 
 cleanup:
     if (socket_fd >= 0) {
         (void)close(socket_fd);
+    }
+    if (second_socket >= 0) {
+        (void)close(second_socket);
+    }
+    if (third_socket >= 0) {
+        (void)close(third_socket);
     }
     if (server_process > 0) {
         (void)kill(server_process, SIGTERM);

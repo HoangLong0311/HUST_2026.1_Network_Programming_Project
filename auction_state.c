@@ -124,6 +124,8 @@ static void add_default_room(struct auction_state *state, const char *name)
                    state->next_room_number++);
     (void)snprintf(room->name, sizeof(room->name), "%s", name);
     (void)snprintf(room->owner_id, sizeof(room->owner_id), "%s", "SYSTEM");
+    room->participant_count = 0;
+    room->ended = false;
 }
 
 void auction_state_init(struct auction_state *state)
@@ -171,6 +173,8 @@ enum state_result participant_connect(struct auction_state *state,
         return STATE_INTERNAL_ERROR;
     }
     new_participant->connected = true;
+    (void)snprintf(new_participant->current_room_id,
+                   sizeof(new_participant->current_room_id), "%s", NO_ROOM);
     state->participant_count++;
     state->next_participant_number++;
     *participant = new_participant;
@@ -238,6 +242,8 @@ enum state_result auction_room_create(struct auction_state *state,
     (void)snprintf(new_room->name, sizeof(new_room->name), "%s", name);
     (void)snprintf(new_room->owner_id, sizeof(new_room->owner_id), "%s",
                    owner->id);
+    new_room->participant_count = 0;
+    new_room->ended = false;
     *room = new_room;
     return STATE_OK;
 }
@@ -249,4 +255,148 @@ const struct auction_room *auction_room_at(const struct auction_state *state,
         return NULL;
     }
     return &state->rooms[index];
+}
+
+static int is_room_id(const char *room_id)
+{
+    size_t length;
+    size_t index;
+
+    if (room_id == NULL) {
+        return 0;
+    }
+    length = strlen(room_id);
+    if (length < 4U || length >= ROOM_ID_CAPACITY ||
+        room_id[0] != 'R') {
+        return 0;
+    }
+    for (index = 1U; index < length; index++) {
+        if (room_id[index] < '0' || room_id[index] > '9') {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+struct auction_room *auction_room_find(struct auction_state *state,
+                                       const char *room_id)
+{
+    size_t index;
+
+    if (state == NULL || !is_room_id(room_id)) {
+        return NULL;
+    }
+    for (index = 0; index < state->room_count; index++) {
+        if (strcmp(state->rooms[index].id, room_id) == 0) {
+            return &state->rooms[index];
+        }
+    }
+    return NULL;
+}
+
+const struct auction_room *auction_room_find_const(
+    const struct auction_state *state, const char *room_id)
+{
+    size_t index;
+
+    if (state == NULL) {
+        return NULL;
+    }
+    if (!is_room_id(room_id)) {
+        return NULL;
+    }
+    for (index = 0; index < state->room_count; index++) {
+        if (strcmp(state->rooms[index].id, room_id) == 0) {
+            return &state->rooms[index];
+        }
+    }
+    return NULL;
+}
+
+enum state_result auction_room_join(struct auction_state *state,
+                                    struct participant *participant,
+                                    const char *room_id)
+{
+    struct auction_room *room;
+    size_t index;
+
+    if (state == NULL || participant == NULL ||
+        !is_connected_participant(state, participant) ||
+        !is_room_id(room_id)) {
+        return STATE_INVALID_ARGUMENT;
+    }
+    room = auction_room_find(state, room_id);
+    if (room == NULL) {
+        return STATE_NOT_FOUND;
+    }
+    if (participant->current_room_id[0] != '-' &&
+        strcmp(participant->current_room_id, NO_ROOM) != 0) {
+        return STATE_ALREADY_CONNECTED;
+    }
+    if (room->ended) {
+        return STATE_ROOM_ENDED;
+    }
+    if (room->participant_count >= MAX_PARTICIPANTS_PER_ROOM) {
+        return STATE_ROOM_FULL;
+    }
+    for (index = 0; index < room->participant_count; index++) {
+        if (strcmp(room->participant_ids[index], participant->id) == 0) {
+            return STATE_ALREADY_CONNECTED;
+        }
+    }
+
+    (void)snprintf(room->participant_ids[room->participant_count],
+                   PARTICIPANT_ID_CAPACITY, "%s", participant->id);
+    room->participant_count++;
+    (void)snprintf(participant->current_room_id,
+                   sizeof(participant->current_room_id), "%s", room_id);
+    return STATE_OK;
+}
+
+enum state_result auction_room_leave(struct auction_state *state,
+                                     struct participant *participant,
+                                     const char *room_id)
+{
+    struct auction_room *room;
+    size_t index;
+    size_t found_index = room_id == NULL ? 0U : MAX_PARTICIPANTS_PER_ROOM;
+
+    if (state == NULL || participant == NULL || room_id == NULL ||
+        !is_connected_participant(state, participant) ||
+        !is_room_id(room_id)) {
+        return STATE_INVALID_ARGUMENT;
+    }
+    if (strcmp(participant->current_room_id, NO_ROOM) == 0 ||
+        participant->current_room_id[0] == '\0') {
+        return STATE_NOT_IN_ROOM;
+    }
+    if (strcmp(participant->current_room_id, room_id) != 0) {
+        return STATE_ROOM_MISMATCH;
+    }
+    room = auction_room_find(state, room_id);
+    if (room == NULL) {
+        return STATE_NOT_FOUND;
+    }
+    for (index = 0; index < room->participant_count; index++) {
+        if (strcmp(room->participant_ids[index], participant->id) == 0) {
+            found_index = index;
+            break;
+        }
+    }
+    if (found_index == MAX_PARTICIPANTS_PER_ROOM) {
+        return STATE_NOT_IN_ROOM;
+    }
+
+    if (found_index + 1U < room->participant_count) {
+        memmove(&room->participant_ids[found_index],
+                &room->participant_ids[found_index + 1U],
+                (room->participant_count - found_index - 1U) *
+                    sizeof(room->participant_ids[0]));
+    }
+    room->participant_count--;
+    memset(room->participant_ids[room->participant_count], 0,
+           PARTICIPANT_ID_CAPACITY);
+    (void)snprintf(participant->current_room_id,
+                   sizeof(participant->current_room_id), "%s", NO_ROOM);
+    return STATE_OK;
 }

@@ -87,6 +87,12 @@ static int receive_response(int socket_fd, uint32_t request_id,
 
     printf("%s: ", label);
     print_payload(&response);
+    if ((expected_type == MSG_JOIN_RESULT ||
+         expected_type == MSG_LEAVE_RESULT) &&
+        response.header.payload_length >= 4U &&
+        strncmp((const char *)response.payload, "FAIL", 4U) == 0) {
+        return 1;
+    }
     return 0;
 }
 
@@ -119,12 +125,15 @@ int main(int argc, char *argv[])
     int socket_fd;
     int request_result;
     uint32_t request_id = 1;
+    char current_room_id[ROOM_ID_CAPACITY];
     uint8_t initial_type = MSG_CONNECT;
     uint8_t expected_initial_type = MSG_CONNECT_RESULT;
     const char *initial_payload = "";
     size_t initial_payload_length = 0;
     char reconnect_payload[PARTICIPANT_ID_CAPACITY + SESSION_TOKEN_CAPACITY];
     struct sockaddr_in server_address;
+
+    (void)snprintf(current_room_id, sizeof(current_room_id), "%s", NO_ROOM);
 
     if (argc == 2) {
         if (strcmp(argv[1], "--reconnect") == 0 ||
@@ -194,26 +203,43 @@ int main(int argc, char *argv[])
     }
 
     for (;;) {
-        char command[ROOM_NAME_CAPACITY + 16U];
+        char command[ROOM_NAME_CAPACITY + 32U];
         const char *room_name;
 
-        printf("Nhap lenh (LIST_ROOMS, CREATE_ROOM <ten>, exit): ");
+        printf("\n===== ONLINE AUCTION CLIENT =====\n");
+        printf("1. List rooms\n");
+        printf("2. Create room\n");
+        printf("3. Join room\n");
+        printf("4. Leave room\n");
+        printf("5. View current room\n");
+        printf("6. View room state\n");
+        printf("7. Reconnect help\n");
+        printf("0. Exit\n");
+        printf("Choose: ");
         fflush(stdout);
         if (fgets(command, sizeof(command), stdin) == NULL) {
             break;
         }
         trim_line_ending(command);
-        if (strcmp(command, "exit") == 0) {
+        if (strcmp(command, "0") == 0 || strcmp(command, "exit") == 0) {
             break;
         }
 
         request_id++;
-        if (strcmp(command, "LIST_ROOMS") == 0) {
+        if (strcmp(command, "1") == 0) {
             request_result = exchange_request(socket_fd, MSG_LIST_ROOMS,
                                               request_id, NULL, 0,
                                               MSG_ROOM_LIST, "ROOM_LIST");
-        } else if (strncmp(command, "CREATE_ROOM ", 12U) == 0) {
-            room_name = command + 12U;
+        } else if (strcmp(command, "2") == 0) {
+            char room_name_input[ROOM_NAME_CAPACITY];
+
+            printf("Room name: ");
+            fflush(stdout);
+            if (fgets(room_name_input, sizeof(room_name_input), stdin) == NULL) {
+                continue;
+            }
+            trim_line_ending(room_name_input);
+            room_name = room_name_input;
             if (!is_safe_text(room_name, ROOM_NAME_CAPACITY, 0)) {
                 printf("Ten phong khong hop le.\n");
                 continue;
@@ -223,6 +249,82 @@ int main(int argc, char *argv[])
                                               strlen(room_name),
                                               MSG_CREATE_ROOM_RESULT,
                                               "CREATE_ROOM_RESULT");
+        } else if (strcmp(command, "3") == 0) {
+            char room_id[ROOM_ID_CAPACITY];
+
+            printf("[JOIN ROOM]\nRoom ID: ");
+            fflush(stdout);
+            if (fgets(room_id, sizeof(room_id), stdin) == NULL) {
+                continue;
+            }
+            trim_line_ending(room_id);
+            if (!is_safe_text(room_id, ROOM_ID_CAPACITY, 0)) {
+                printf("Room ID khong hop le.\n");
+                continue;
+            }
+            printf("Joining room %s...\n", room_id);
+            request_result = exchange_request(socket_fd, MSG_JOIN_ROOM,
+                                              request_id, room_id,
+                                              strlen(room_id),
+                                              MSG_JOIN_RESULT, "JOIN_RESULT");
+            if (request_result == 0) {
+                (void)snprintf(current_room_id, sizeof(current_room_id),
+                               "%s", room_id);
+                printf("Successfully joined room %s.\n", room_id);
+                printf("Current room: %s\n", current_room_id);
+                request_result = receive_response(socket_fd, request_id,
+                                                  MSG_ROOM_STATE,
+                                                  "ROOM_STATE");
+            } else if (request_result == 1) {
+                printf("Join room failed.\n");
+            }
+        } else if (strcmp(command, "4") == 0) {
+            char room_id[ROOM_ID_CAPACITY];
+
+            if (strcmp(current_room_id, NO_ROOM) == 0) {
+                printf("You are not currently in a room.\n");
+                continue;
+            }
+            printf("[LEAVE ROOM]\nLeaving room %s...\n", current_room_id);
+            (void)snprintf(room_id, sizeof(room_id), "%s", current_room_id);
+            request_result = exchange_request(socket_fd, MSG_LEAVE_ROOM,
+                                              request_id, room_id,
+                                              strlen(room_id),
+                                              MSG_LEAVE_RESULT,
+                                              "LEAVE_RESULT");
+            if (request_result == 0) {
+                (void)snprintf(current_room_id, sizeof(current_room_id),
+                               "%s", NO_ROOM);
+                printf("Successfully left room %s.\n", room_id);
+                printf("You are not currently in a room.\n");
+                request_result = receive_response(socket_fd, request_id,
+                                                  MSG_ROOM_STATE,
+                                                  "ROOM_STATE");
+            }
+        } else if (strcmp(command, "5") == 0) {
+            if (strcmp(current_room_id, NO_ROOM) == 0) {
+                printf("You are not currently in a room.\n");
+            } else {
+                printf("Current room: %s\n", current_room_id);
+            }
+            continue;
+        } else if (strcmp(command, "6") == 0) {
+            char room_id[ROOM_ID_CAPACITY];
+
+            printf("Room ID: ");
+            fflush(stdout);
+            if (fgets(room_id, sizeof(room_id), stdin) == NULL) {
+                continue;
+            }
+            trim_line_ending(room_id);
+            request_result = exchange_request(socket_fd, MSG_GET_ROOM_STATE,
+                                              request_id, room_id,
+                                              strlen(room_id),
+                                              MSG_ROOM_STATE, "ROOM_STATE");
+        } else if (strcmp(command, "7") == 0) {
+            printf("Reconnect tu terminal moi:\n");
+            printf("  ./client --reconnect P001 <session-token>\n");
+            continue;
         } else {
             printf("Lenh khong hop le.\n");
             continue;
