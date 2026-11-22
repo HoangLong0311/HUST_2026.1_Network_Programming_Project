@@ -210,11 +210,11 @@ enum state_result participant_reconnect(struct auction_state *state,
     if (strcmp(existing->token, token) != 0) {
         return STATE_TOKEN_MISMATCH;
     }
+    *participant = existing;
     if (existing->connected) {
         return STATE_ALREADY_CONNECTED;
     }
     existing->connected = true;
-    *participant = existing;
     return STATE_OK;
 }
 
@@ -415,4 +415,41 @@ enum state_result auction_room_leave(struct auction_state *state,
     (void)snprintf(participant->current_room_id,
                    sizeof(participant->current_room_id), "%s", NO_ROOM);
     return STATE_OK;
+}
+
+bool auction_room_timer_start(struct auction_room *room, uint64_t now_ms,
+                              uint64_t duration_ms)
+{
+    if (room == NULL || room->ended || room->timer_active ||
+        room->auction_status != AUCTION_RUNNING ||
+        duration_ms < AUCTION_MIN_DURATION_MS ||
+        duration_ms > AUCTION_MAX_DURATION_MS ||
+        now_ms > UINT64_MAX - duration_ms) {
+        return false;
+    }
+    room->deadline_ms = now_ms + duration_ms;
+    room->next_update_ms = now_ms;
+    room->warning_sent = false;
+    room->timer_active = true;
+    return true;
+}
+
+uint64_t auction_room_remaining_ms(const struct auction_room *room,
+                                   uint64_t now_ms)
+{
+    if (room == NULL || !room->timer_active || now_ms >= room->deadline_ms) {
+        return 0;
+    }
+    return room->deadline_ms - now_ms;
+}
+
+bool auction_room_expire(struct auction_room *room, uint64_t now_ms)
+{
+    if (room == NULL || !room->timer_active || now_ms < room->deadline_ms) {
+        return false;
+    }
+    room->timer_active = false;
+    room->ended = true;
+    room->auction_status = AUCTION_ENDED;
+    return true;
 }

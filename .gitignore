@@ -1,2 +1,11 @@
 *.o
 *.log
+/server
+/client
+/tests/test_protocol
+/tests/test_auction_state
+/tests/test_server_integration
+/tests/test_auction
+/tests/test_timer
+/tests/test_server_timer
+/tests/test_logger

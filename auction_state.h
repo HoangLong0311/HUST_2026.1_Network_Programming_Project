@@ -14,6 +14,9 @@
 #define NO_ROOM "-1"
 #define AUCTION_ID_CAPACITY 8U
 #define MAX_BID_HISTORY 128U
+#define AUCTION_MIN_DURATION_MS UINT64_C(1000)
+#define AUCTION_MAX_DURATION_MS UINT64_C(3600000)
+#define AUCTION_DEFAULT_DURATION_MS UINT64_C(60000)
 
 #define PARTICIPANT_ID_CAPACITY 8U
 #define SESSION_TOKEN_CAPACITY 33U
@@ -36,6 +39,10 @@ struct auction_room {
     char participant_ids[MAX_PARTICIPANTS_PER_ROOM][PARTICIPANT_ID_CAPACITY];
     size_t participant_count;
     bool ended;
+    bool timer_active;
+    bool warning_sent;
+    uint64_t deadline_ms;
+    uint64_t next_update_ms;
     char auction_id[AUCTION_ID_CAPACITY];
     enum auction_status {
         AUCTION_WAITING = 0,
@@ -108,5 +115,11 @@ enum state_result auction_room_join(struct auction_state *state,
 enum state_result auction_room_leave(struct auction_state *state,
                                      struct participant *participant,
                                      const char *room_id);
+
+bool auction_room_timer_start(struct auction_room *room, uint64_t now_ms,
+                              uint64_t duration_ms);
+uint64_t auction_room_remaining_ms(const struct auction_room *room,
+                                   uint64_t now_ms);
+bool auction_room_expire(struct auction_room *room, uint64_t now_ms);
 
 #endif

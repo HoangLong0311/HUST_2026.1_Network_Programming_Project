@@ -1,4 +1,4 @@
-# Online Auction - G3, G4, G5 & G6
+# Online Auction - G3 đến G8
 
 Đây là chương trình TCP socket bằng C trên Linux, biên dịch bằng GCC. Bản
 hiện tại mở rộng Protocol V1 với:
@@ -7,10 +7,11 @@ hiện tại mở rộng Protocol V1 với:
 - **G4:** danh sách phòng đấu giá trong bộ nhớ và `CREATE_ROOM`.
 - **G5:** JOIN_ROOM, LEAVE_ROOM, membership hai chiều và room state.
 - **G6:** PLACE_BID, BID_RESULT, BID_UPDATE và bid history trong RAM.
+- **G7:** timer phiên đấu giá, cảnh báo thời gian và kết quả.
+- **G8:** kiểm thử framing TCP, timer, luồng đấu giá và xử lý lỗi.
 
-Chưa triển khai `JOIN`/`LEAVE`, đặt giá, timer, lưu dữ liệu lâu dài hoặc
-multithreading. Server dùng `poll()` để phục vụ nhiều client trong một tiến
-trình; mỗi request vẫn được xử lý tuần tự trong event loop.
+Server dùng `poll()` để phục vụ nhiều client trong một tiến trình; request và
+timer được xử lý tuần tự trong event loop. Dữ liệu chưa được lưu lâu dài.
 
 ## Cấu trúc mã nguồn
 
@@ -26,7 +27,7 @@ trình; mỗi request vẫn được xử lý tuần tự trong event loop.
   phòng.
 - `logger.h`, `logger.c`: log append-only cho message gửi/nhận và sự kiện lỗi.
 - `Makefile`: build chương trình và test.
-- `tests/`: test protocol, state và server integration.
+- `tests/`: test protocol, state, timer, logger và server integration.
 
 ## Biên dịch và kiểm thử
 
@@ -45,16 +46,11 @@ make client
 make clean
 ```
 
-`make test` biên dịch và chạy:
-
-1. test encode/decode và round-trip frame;
-2. test tạo participant, disconnect/reconnect, token và phòng;
-3. test server thật, quyền truy cập trước `CONNECT`, request ID, reconnect,
-   tạo phòng và liệt kê phòng.
-4. test membership: join/leave, room khác, not-in-room, room mismatch,
-   room ended và room full.
-5. test auction: starting/minimum bid, bid thấp, bid âm, history và state
-   RUNNING/WAITING.
+`make test` kiểm tra encode/decode, TCP frame bị chia/gộp, ngắt giữa frame,
+participant, JOIN/LEAVE, đặt giá, đồng bộ session/auction, reconnect takeover,
+timer, kết quả và che token trong log. Test integration khởi chạy server trên
+port được hệ điều hành cấp và kết nối nhiều client thật; kết quả G7 gồm trường
+hợp có người thắng, `NO_BID`, bid sau hạn và reconnect sau khi kết thúc.
 
 ## Chạy chương trình
 
@@ -70,6 +66,26 @@ integration test độc lập:
 ```bash
 ./server 25000
 ```
+
+Thời gian đấu giá mặc định của mỗi phòng là 60000 ms, tính từ khi server tạo
+phòng. Để thử nhanh, truyền thêm thời gian (1000–3600000 ms) sau port:
+
+```bash
+./server 8080 15000
+```
+
+Hai phòng mặc định bắt đầu đếm giờ khi server khởi động; phòng mới bắt đầu khi
+được tạo. Hết giờ, server kết thúc phiên một lần, giữ người dẫn đầu và giá hợp
+lệ của G6, rồi thông báo kết quả cho các thành viên đang kết nối. Nếu chưa có
+bid, kết quả là `NO_BID`. Phòng đã kết thúc không nhận thêm bid hoặc thành viên
+mới; hiện chưa có lệnh mở lại phiên. Trạng thái chỉ tồn tại trong RAM.
+
+Server gửi `TIME_UPDATE` khoảng mỗi giây và cảnh báo khi còn không quá 10 giây.
+Thành viên vừa JOIN hoặc RECONNECT được gửi thời gian hiện tại; nếu phiên đã kết
+thúc, participant reconnect vào membership cũ được gửi lại kết quả. Sau CONNECT
+hoặc RECONNECT, client gọi `GET_SESSION_STATE`; nếu đang ở phòng, client gọi tiếp
+`GET_AUCTION_STATE` để khôi phục phòng, giá, người dẫn đầu, trạng thái và thời
+gian còn lại. Vì vậy người JOIN muộn không phải chờ bid tiếp theo mới biết giá.
 
 Terminal 2:
 
@@ -141,8 +157,9 @@ time=2026-11-09T15:20:00+0700 pid=1234 component=CLIENT direction=SEND type=LIST
 ```
 
 File được mở ở chế độ append và flush sau mỗi dòng để giữ log khi chương
-trình đang chạy. Payload của `RECONNECT` và `RECONNECT_RESULT` được che token
-thành `<REDACTED>`; không nên ghi credential đầy đủ vào log. Lỗi gửi/nhận và
+trình đang chạy. Toàn bộ payload của `CONNECT_RESULT`, `RECONNECT` và
+`RECONNECT_RESULT` được che thành `<REDACTED>`, kể cả payload sai định dạng.
+Lỗi gửi/nhận và
 frame không hợp lệ cũng được ghi với `level=ERROR`.
 
 `auction.log` là dữ liệu runtime, không phải source code; có thể xóa trước một
@@ -195,15 +212,23 @@ không đáng tin cậy.
 | `PLACE_BID` | `0x15` | `<room-id>\|<auction-id>\|<amount>` | `BID_RESULT` |
 | `BID_RESULT` | `0x16` | — | `OK\|<room-id>\|<amount>` hoặc `FAIL\|<reason>[\|<minimum>]` |
 | `BID_UPDATE` | `0x17` | — | `<room-id>\|<auction-id>\|<new-price>\|<leader-id>`; push `request_id=0` |
+| `GET_SESSION_STATE` | `0x18` | Rỗng | `SESSION_STATE` |
+| `SESSION_STATE` | `0x19` | — | `OK\|<room-id>`; `<room-id>` là `-1` nếu chưa JOIN |
+| `GET_AUCTION_STATE` | `0x1A` | `<room-id>` | `AUCTION_STATE`; chỉ member của phòng |
+| `AUCTION_STATE` | `0x1B` | — | `<room-id>\|<auction-id>\|<status>\|<price>\|<leader>\|<remaining-ms>\|<starting-price>\|<min-increment>\|<bid-count>` |
+| `TIME_UPDATE` | `0x10` | — | `<room-id>\|<auction-id>\|<remaining-ms>`; push `request_id=0` |
+| `TIME_WARNING` | `0x11` | — | `<room-id>\|<auction-id>\|<seconds>`; push `request_id=0` |
+| `AUCTION_RESULT` | `0x13` | — | `<room-id>\|<auction-id>\|SOLD\|<winner-id>\|<price>` hoặc `<room-id>\|<auction-id>\|NO_BID`; push `request_id=0` |
 | `ERROR` | `0x14` | — | Mã lỗi dạng text |
 
-Mọi response ứng với request đều echo đúng `request_id`. Message tự gửi
-không có trong phiên bản hiện tại; nếu có thì dùng `request_id = 0`.
+Mọi response ứng với request đều echo đúng `request_id`; thông báo server chủ
+động gửi dùng `request_id = 0`.
 
 0x07/0x08 đã được giữ cho G4 `CREATE_ROOM/CREATE_ROOM_RESULT`. Vì vậy G5 dùng
 0x0D/0x0E mới cho `GET_ROOM_STATE/ROOM_STATE`, không làm thay đổi semantic G4
 và không dùng lại mã hiện có. JOIN/LEAVE dùng đúng 0x09–0x0C. G6 dùng mã mới
-0x15/0x16/0x17 để tránh xung đột 0x0D/0x0E của room-state.
+0x15/0x16/0x17 để tránh xung đột 0x0D/0x0E của room-state. Các message đồng bộ
+0x18–0x1B là phần mở rộng tương thích ngược; mã cũ không bị đổi.
 
 Các mã lỗi chính gồm:
 
@@ -249,8 +274,10 @@ LF, và phải nằm trong giới hạn buffer được định nghĩa ở `auct
   frame không chặn các client khác. Một lần `recv()` có thể chứa nhiều frame;
   server tách và xử lý lần lượt từng frame hoàn chỉnh.
 - Giới hạn hiện tại là 64 client đồng thời; kết nối vượt giới hạn bị từ chối.
-- Chưa có multithreading. Payload phản hồi tối đa 4096 byte được gửi đồng bộ;
-  ứng dụng tải lớn hơn cần thêm output queue và theo dõi `POLLOUT`.
+- Chưa có multithreading. Mỗi client có hàng đợi gửi giới hạn và `POLLOUT`;
+  khi hàng đợi đầy hoặc không tiến triển trong 15 giây, server ngắt client chậm.
+- Frame nhận dở quá 15 giây và socket chưa xác thực quá 30 giây bị đóng để tránh
+  chiếm slot. Kết nối đã xác thực và đang idle không bị timeout.
 
 ## G5 - JOIN_ROOM / LEAVE_ROOM
 
@@ -264,7 +291,9 @@ LF, và phải nằm trong giới hạn buffer được định nghĩa ở `auct
 - LEAVE chỉ xóa membership; participant không bị xóa khỏi Participant Manager,
   bid history chưa tồn tại ở G5 và room không tự kết thúc.
 - Disconnect không phải leave: membership và `current_room_id` được giữ. Khi
-  reconnect, socket mới được gắn vào participant cũ.
+  reconnect, socket mới được gắn vào participant cũ. Token hợp lệ có thể thay
+  thế socket cũ còn half-open; server tách socket cũ trước khi kích hoạt socket
+  mới để không làm mất trạng thái `connected`.
 - Room có tối đa `32` participant (`MAX_PARTICIPANTS_PER_ROOM`).
 
 ## G6 - PLACE_BID / BID_UPDATE
@@ -282,5 +311,26 @@ LF, và phải nằm trong giới hạn buffer được định nghĩa ở `auct
   nhận update. Client ở phòng khác hoặc client đã disconnect không nhận.
 - Mỗi auction lưu tối đa `128` bid record. Khi đầy, server trả `SERVER_ERROR`
   thay vì thay đổi giá nếu chưa ghi được history.
-- Disconnect không reset giá hoặc highest bidder. G7 chỉ cần thêm timer,
-  kết thúc auction và broadcast trạng thái cuối.
+- Disconnect không reset giá hoặc highest bidder; G7 giữ kết quả của bid hợp lệ
+  khi timer kết thúc.
+- `GET_AUCTION_STATE` chỉ cho member đúng phòng và trả snapshot authoritative,
+  dùng cho JOIN muộn và RECONNECT; client phòng khác nhận `ROOM_MISMATCH` hoặc
+  `NOT_IN_ROOM`.
+
+## G7 - timer và kết thúc đấu giá
+
+- Mỗi room có deadline monotonic độc lập; hết hạn được kiểm tra trong event loop
+  và ngay trước khi xử lý bid, nên bid đến sau deadline luôn bị từ chối.
+- Server push `TIME_UPDATE`, gửi một `TIME_WARNING` khi còn tối đa 10 giây và
+  chỉ phát một `AUCTION_RESULT` (`SOLD` hoặc `NO_BID`).
+- Room đã `ENDED` giữ nguyên kết quả trong RAM; member reconnect được phát lại
+  kết quả và có thể lấy snapshot với thời gian còn lại bằng `0`.
+
+## G8 - kiểm thử và xử lý lỗi
+
+- Sáu nhóm test bao phủ protocol framing, state G3–G6, timer, multi-client TCP,
+  reconnect/session snapshot, late JOIN, access control và redaction của logger.
+- Server dùng input/output buffer riêng, giới hạn công việc mỗi vòng `poll()`,
+  xử lý partial/coalesced frame và cách ly client gửi header sai hoặc bị treo.
+- Ngoài build cảnh báo chuẩn, mã đã được kiểm tra bằng GCC `-fanalyzer` và toàn
+  bộ test chạy với AddressSanitizer + UndefinedBehaviorSanitizer.
