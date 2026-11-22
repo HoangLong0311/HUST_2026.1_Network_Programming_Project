@@ -9,8 +9,8 @@ TEST_TARGETS = tests/test_protocol tests/test_auction_state tests/test_server_in
 
 all: $(TARGETS)
 
-server: server.c protocol.c protocol.h common.h auction_state.c auction_state.h logger.c logger.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ server.c protocol.c auction_state.c logger.c
+server: server.c protocol.c protocol.h common.h auction_state.c auction_state.h auction.c auction.h logger.c logger.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ server.c protocol.c auction_state.c auction.c logger.c
 
 client: client.c protocol.c protocol.h common.h auction_state.h logger.c logger.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ client.c protocol.c logger.c
@@ -18,8 +18,8 @@ client: client.c protocol.c protocol.h common.h auction_state.h logger.c logger.
 tests/test_protocol: tests/test_protocol.c protocol.c protocol.h common.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -I. -o $@ tests/test_protocol.c protocol.c
 
-tests/test_auction_state: tests/test_auction_state.c auction_state.c auction_state.h common.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) -I. -o $@ tests/test_auction_state.c auction_state.c
+tests/test_auction_state: tests/test_auction_state.c auction_state.c auction_state.h auction.c auction.h common.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -I. -o $@ tests/test_auction_state.c auction_state.c auction.c
 
 tests/test_server_integration: tests/test_server_integration.c protocol.c protocol.h auction_state.h common.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -I. -o $@ tests/test_server_integration.c protocol.c

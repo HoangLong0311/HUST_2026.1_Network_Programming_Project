@@ -1,4 +1,4 @@
-# Online Auction - G3, G4 & G5
+# Online Auction - G3, G4, G5 & G6
 
 Đây là chương trình TCP socket bằng C trên Linux, biên dịch bằng GCC. Bản
 hiện tại mở rộng Protocol V1 với:
@@ -6,6 +6,7 @@ hiện tại mở rộng Protocol V1 với:
 - **G3:** participant, `CONNECT`, session token và `RECONNECT`.
 - **G4:** danh sách phòng đấu giá trong bộ nhớ và `CREATE_ROOM`.
 - **G5:** JOIN_ROOM, LEAVE_ROOM, membership hai chiều và room state.
+- **G6:** PLACE_BID, BID_RESULT, BID_UPDATE và bid history trong RAM.
 
 Chưa triển khai `JOIN`/`LEAVE`, đặt giá, timer, lưu dữ liệu lâu dài hoặc
 multithreading. Server dùng `poll()` để phục vụ nhiều client trong một tiến
@@ -18,6 +19,8 @@ trình; mỗi request vẫn được xử lý tuần tự trong event loop.
   I/O.
 - `auction_state.h`, `auction_state.c`: quản lý participant, token và phòng
   trong bộ nhớ, bao gồm membership và `current_room_id`.
+- `auction.h`, `auction.c`: business logic đặt bid, giá tối thiểu, auction
+  state và bid history.
 - `server.c`: socket server, xác thực request và điều phối state.
 - `client.c`: client tương tác dòng lệnh, hỗ trợ connect/reconnect và các lệnh
   phòng.
@@ -50,6 +53,8 @@ make clean
    tạo phòng và liệt kê phòng.
 4. test membership: join/leave, room khác, not-in-room, room mismatch,
    room ended và room full.
+5. test auction: starting/minimum bid, bid thấp, bid âm, history và state
+   RUNNING/WAITING.
 
 ## Chạy chương trình
 
@@ -101,10 +106,11 @@ Hoặc dùng menu tương tác:
 2. Create room
 3. Join room
 4. Leave room
-5. View current room
-6. View room state
-7. Reconnect help
-0. Exit
+5. View room state
+6. Place bid
+7. View current room
+8. Reconnect help
+9. Exit
 ```
 
 Khi join thành công, server trả `JOIN_RESULT` rồi `ROOM_STATE`. Client chỉ
@@ -186,6 +192,9 @@ không đáng tin cậy.
 | `LEAVE_RESULT` | `0x0C` | — | `OK|<room-id>` hoặc `FAIL|<reason>` |
 | `GET_ROOM_STATE` | `0x0D` | `<room-id>` | `ROOM_STATE` |
 | `ROOM_STATE` | `0x0E` | — | `<room-id>\|<name>\|<OPEN/ENDED>\|<participant-list>\|<count>` |
+| `PLACE_BID` | `0x15` | `<room-id>\|<auction-id>\|<amount>` | `BID_RESULT` |
+| `BID_RESULT` | `0x16` | — | `OK\|<room-id>\|<amount>` hoặc `FAIL\|<reason>[\|<minimum>]` |
+| `BID_UPDATE` | `0x17` | — | `<room-id>\|<auction-id>\|<new-price>\|<leader-id>`; push `request_id=0` |
 | `ERROR` | `0x14` | — | Mã lỗi dạng text |
 
 Mọi response ứng với request đều echo đúng `request_id`. Message tự gửi
@@ -193,7 +202,8 @@ không có trong phiên bản hiện tại; nếu có thì dùng `request_id = 0
 
 0x07/0x08 đã được giữ cho G4 `CREATE_ROOM/CREATE_ROOM_RESULT`. Vì vậy G5 dùng
 0x0D/0x0E mới cho `GET_ROOM_STATE/ROOM_STATE`, không làm thay đổi semantic G4
-và không dùng lại mã hiện có. JOIN/LEAVE dùng đúng 0x09–0x0C.
+và không dùng lại mã hiện có. JOIN/LEAVE dùng đúng 0x09–0x0C. G6 dùng mã mới
+0x15/0x16/0x17 để tránh xung đột 0x0D/0x0E của room-state.
 
 Các mã lỗi chính gồm:
 
@@ -213,6 +223,10 @@ Các mã lỗi chính gồm:
 - `NOT_IN_ROOM`
 - `ROOM_MISMATCH`
 - `INVALID_ROOM_ID`
+- `INVALID_AMOUNT`
+- `AUCTION_NOT_FOUND`
+- `AUCTION_NOT_ACTIVE`
+- `PRICE_TOO_LOW`
 - `UNKNOWN_MESSAGE_TYPE`
 - `INTERNAL_ERROR`
 
@@ -252,3 +266,21 @@ LF, và phải nằm trong giới hạn buffer được định nghĩa ở `auct
 - Disconnect không phải leave: membership và `current_room_id` được giữ. Khi
   reconnect, socket mới được gắn vào participant cũ.
 - Room có tối đa `32` participant (`MAX_PARTICIPANTS_PER_ROOM`).
+
+## G6 - PLACE_BID / BID_UPDATE
+
+- Mỗi room có một auction `A001` mặc định ở trạng thái `RUNNING`.
+- Giá khởi điểm là `100000`, bước giá tối thiểu là `10000`.
+- Bid phải là số nguyên dương `int64_t`, không nhận ký tự, dấu âm hoặc overflow.
+- Giá tối thiểu là starting price khi chưa có bid; sau đó là
+  `current_price + min_increment`.
+- Bid thành công cập nhật state trước, ghi `bid_history`, gửi `BID_RESULT`
+  cho bidder, rồi broadcast `BID_UPDATE` tới tất cả member trong cùng room.
+- BID_UPDATE được gửi cho cả bidder và các member khác trong room. Client
+  dùng `request_id = 0`; BID_RESULT echo request ID của PLACE_BID.
+- Chỉ client đang connected, đang join room và nằm trong danh sách member mới
+  nhận update. Client ở phòng khác hoặc client đã disconnect không nhận.
+- Mỗi auction lưu tối đa `128` bid record. Khi đầy, server trả `SERVER_ERROR`
+  thay vì thay đổi giá nếu chưa ghi được history.
+- Disconnect không reset giá hoặc highest bidder. G7 chỉ cần thêm timer,
+  kết thúc auction và broadcast trạng thái cuối.

@@ -1,4 +1,5 @@
 #include "auction_state.h"
+#include "auction.h"
 #include "logger.h"
 #include "protocol.h"
 
@@ -9,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -495,9 +497,220 @@ struct client_connection {
     struct participant *participant;
 };
 
+static int participant_in_room(const struct auction_room *room,
+                               const char *participant_id)
+{
+    size_t index;
+
+    if (room == NULL || participant_id == NULL) {
+        return 0;
+    }
+    for (index = 0; index < room->participant_count; index++) {
+        if (strcmp(room->participant_ids[index], participant_id) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void broadcast_bid_update(struct auction_room *room,
+                                 const struct auction_state *state,
+                                 struct client_connection *clients,
+                                 size_t client_count)
+{
+    char payload[PROTOCOL_MAX_PAYLOAD];
+    int written;
+    size_t index;
+
+    written = snprintf(payload, sizeof(payload), "%s|%s|%" PRId64 "|%s",
+                       room->id, room->auction_id, room->current_price,
+                       room->highest_bidder_id);
+    if (written < 0 || (size_t)written >= sizeof(payload)) {
+        logger_event(&server_logger, "ERROR",
+                     "[BID UPDATE] failed to format broadcast");
+        return;
+    }
+    for (index = 0; index < client_count; index++) {
+        struct client_connection *client = &clients[index];
+
+        if (client->socket_fd < 0 || client->participant == NULL ||
+            !client->participant->connected ||
+            strcmp(client->participant->current_room_id, room->id) != 0 ||
+            !participant_in_room(room, client->participant->id)) {
+            continue;
+        }
+        if (send_payload(client->socket_fd, MSG_BID_UPDATE, 0,
+                         payload, (size_t)written) != PROTOCOL_OK) {
+            logger_event(&server_logger, "ERROR",
+                         "[BID UPDATE] send failed");
+        }
+    }
+
+    (void)state;
+}
+
+static int handle_place_bid(int socket_fd, const struct message *message,
+                            struct auction_state *state,
+                            struct participant *participant,
+                            struct client_connection *clients,
+                            size_t client_count)
+{
+    char room_id[ROOM_ID_CAPACITY];
+    char auction_id[AUCTION_ID_CAPACITY];
+    char amount_text[64];
+    char *parts[3];
+    char *separator;
+    char text[PROTOCOL_MAX_PAYLOAD];
+    struct auction_room *room;
+    int64_t amount;
+    int64_t minimum;
+    enum auction_bid_result bid_result;
+    char *end;
+
+    if (participant == NULL || !participant->connected) {
+        logger_event(&server_logger, "INFO",
+                     "[BID REJECTED] INVALID_PARTICIPANT");
+        return send_text(socket_fd, MSG_BID_RESULT,
+                         message->header.request_id,
+                         "FAIL|INVALID_PARTICIPANT");
+    }
+    if (payload_to_text(message, text, sizeof(text), 0, 1) != 0) {
+        return send_text(socket_fd, MSG_BID_RESULT,
+                         message->header.request_id,
+                         "FAIL|INVALID_AMOUNT");
+    }
+
+    parts[0] = text;
+    separator = strchr(parts[0], '|');
+    if (separator == NULL) {
+        return send_text(socket_fd, MSG_BID_RESULT,
+                         message->header.request_id,
+                         "FAIL|INVALID_AMOUNT");
+    }
+    *separator = '\0';
+    parts[1] = separator + 1;
+    separator = strchr(parts[1], '|');
+    if (separator == NULL) {
+        return send_text(socket_fd, MSG_BID_RESULT,
+                         message->header.request_id,
+                         "FAIL|INVALID_AMOUNT");
+    }
+    *separator = '\0';
+    parts[2] = separator + 1;
+    if (strchr(parts[2], '|') != NULL) {
+        return send_text(socket_fd, MSG_BID_RESULT,
+                         message->header.request_id,
+                         "FAIL|INVALID_AMOUNT");
+    }
+    (void)snprintf(room_id, sizeof(room_id), "%s", parts[0]);
+    (void)snprintf(auction_id, sizeof(auction_id), "%s", parts[1]);
+    (void)snprintf(amount_text, sizeof(amount_text), "%s", parts[2]);
+
+    room = auction_room_find(state, room_id);
+    if (room == NULL) {
+        return send_text(socket_fd, MSG_BID_RESULT,
+                         message->header.request_id,
+                         "FAIL|ROOM_NOT_FOUND");
+    }
+    if (strcmp(participant->current_room_id, NO_ROOM) == 0 ||
+        participant->current_room_id[0] == '\0') {
+        return send_text(socket_fd, MSG_BID_RESULT,
+                         message->header.request_id,
+                         "FAIL|NOT_IN_ROOM");
+    }
+    if (strcmp(participant->current_room_id, room_id) != 0) {
+        return send_text(socket_fd, MSG_BID_RESULT,
+                         message->header.request_id,
+                         "FAIL|ROOM_MISMATCH");
+    }
+    if (!participant_in_room(room, participant->id)) {
+        return send_text(socket_fd, MSG_BID_RESULT,
+                         message->header.request_id,
+                         "FAIL|NOT_IN_ROOM");
+    }
+    if (strcmp(room->auction_id, auction_id) != 0) {
+        return send_text(socket_fd, MSG_BID_RESULT,
+                         message->header.request_id,
+                         "FAIL|AUCTION_NOT_FOUND");
+    }
+
+    errno = 0;
+    amount = strtoll(amount_text, &end, 10);
+    if (errno == ERANGE || end == amount_text || *end != '\0' ||
+        amount_text[0] == '-' || amount_text[0] == '+' ||
+        amount <= 0) {
+        return send_text(socket_fd, MSG_BID_RESULT,
+                         message->header.request_id,
+                         "FAIL|INVALID_AMOUNT");
+    }
+
+    bid_result = auction_place_bid(room, participant->id, amount, &minimum);
+    if (bid_result == AUCTION_BID_PRICE_TOO_LOW) {
+        char payload[128];
+        char event[160];
+        (void)snprintf(payload, sizeof(payload),
+                       "FAIL|PRICE_TOO_LOW|%" PRId64, minimum);
+        (void)snprintf(event, sizeof(event),
+                       "[BID REJECTED] %s PRICE_TOO_LOW minimum=%" PRId64,
+                       participant->id, minimum);
+        logger_event(&server_logger, "INFO", event);
+        return send_text(socket_fd, MSG_BID_RESULT,
+                         message->header.request_id, payload);
+    }
+    if (bid_result == AUCTION_BID_INVALID_AMOUNT) {
+        return send_text(socket_fd, MSG_BID_RESULT,
+                         message->header.request_id,
+                         "FAIL|INVALID_AMOUNT");
+    }
+    if (bid_result == AUCTION_BID_NOT_ACTIVE) {
+        return send_text(socket_fd, MSG_BID_RESULT,
+                         message->header.request_id,
+                         "FAIL|AUCTION_NOT_ACTIVE");
+    }
+    if (bid_result == AUCTION_BID_HISTORY_FULL) {
+        return send_text(socket_fd, MSG_BID_RESULT,
+                         message->header.request_id,
+                         "FAIL|SERVER_ERROR");
+    }
+    if (bid_result != AUCTION_BID_OK) {
+        return send_text(socket_fd, MSG_BID_RESULT,
+                         message->header.request_id,
+                         "FAIL|SERVER_ERROR");
+    }
+
+    {
+        char payload[128];
+        char event[160];
+        (void)snprintf(payload, sizeof(payload), "OK|%s|%" PRId64,
+                       room_id, amount);
+        if (send_text(socket_fd, MSG_BID_RESULT,
+                      message->header.request_id, payload) != PROTOCOL_OK) {
+            return PROTOCOL_ERROR;
+        }
+        (void)snprintf(event, sizeof(event),
+                       "[BID] %s bid %" PRId64 " in %s accepted",
+                       participant->id, amount, room_id);
+        logger_event(&server_logger, "INFO", event);
+        broadcast_bid_update(room, state, clients, client_count);
+        (void)snprintf(event, sizeof(event),
+                       "[BID UPDATE] %s new_price=%" PRId64 " leader=%s",
+                       room_id, amount, participant->id);
+        logger_event(&server_logger, "INFO", event);
+    }
+    return PROTOCOL_OK;
+}
+
+static int handle_place_bid(int socket_fd, const struct message *message,
+                            struct auction_state *state,
+                            struct participant *participant,
+                            struct client_connection *clients,
+                            size_t client_count);
+
 static int process_message(struct client_connection *client,
                            const struct message *message,
-                           struct auction_state *state)
+                           struct auction_state *state,
+                           struct client_connection *clients,
+                           size_t client_count)
 {
     int response_result;
 
@@ -564,6 +777,11 @@ static int process_message(struct client_connection *client,
         }
         break;
     }
+    case MSG_PLACE_BID:
+        response_result = handle_place_bid(client->socket_fd, message, state,
+                                           client->participant,
+                                           clients, client_count);
+        break;
     default:
         response_result = send_error(client->socket_fd,
                                      message->header.request_id,
@@ -575,7 +793,9 @@ static int process_message(struct client_connection *client,
 }
 
 static int process_input(struct client_connection *client,
-                         struct auction_state *state)
+                         struct auction_state *state,
+                         struct client_connection *clients,
+                         size_t client_count)
 {
     while (client->input_length >= PROTOCOL_HEADER_SIZE) {
         struct message message = {0};
@@ -601,7 +821,8 @@ static int process_input(struct client_connection *client,
             memmove(client->input, client->input + frame_length,
                     client->input_length);
         }
-        if (process_message(client, &message, state) != PROTOCOL_OK) {
+        if (process_message(client, &message, state,
+                            clients, client_count) != PROTOCOL_OK) {
             return -1;
         }
     }
@@ -609,7 +830,9 @@ static int process_input(struct client_connection *client,
 }
 
 static int read_client(struct client_connection *client,
-                        struct auction_state *state)
+                        struct auction_state *state,
+                        struct client_connection *clients,
+                        size_t client_count)
 {
     for (;;) {
         ssize_t received;
@@ -625,7 +848,7 @@ static int read_client(struct client_connection *client,
                         MSG_DONTWAIT);
         if (received > 0) {
             client->input_length += (size_t)received;
-            if (process_input(client, state) != 0) {
+            if (process_input(client, state, clients, client_count) != 0) {
                 return -1;
             }
             continue;
@@ -815,7 +1038,8 @@ int main(int argc, char *argv[])
             short events = poll_fds[client_index + 1U].revents;
 
             if (events & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) {
-                int result = read_client(&clients[client_index], &state);
+                int result = read_client(&clients[client_index], &state,
+                                         clients, client_count);
 
                 if (result != 0) {
                     close_client(&clients[client_index]);

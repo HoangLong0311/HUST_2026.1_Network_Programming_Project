@@ -6,11 +6,14 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <time.h>
 
 #define MAX_PARTICIPANTS 64U
 #define MAX_AUCTION_ROOMS 32U
 #define MAX_PARTICIPANTS_PER_ROOM 32U
 #define NO_ROOM "-1"
+#define AUCTION_ID_CAPACITY 8U
+#define MAX_BID_HISTORY 128U
 
 #define PARTICIPANT_ID_CAPACITY 8U
 #define SESSION_TOKEN_CAPACITY 33U
@@ -33,6 +36,23 @@ struct auction_room {
     char participant_ids[MAX_PARTICIPANTS_PER_ROOM][PARTICIPANT_ID_CAPACITY];
     size_t participant_count;
     bool ended;
+    char auction_id[AUCTION_ID_CAPACITY];
+    enum auction_status {
+        AUCTION_WAITING = 0,
+        AUCTION_RUNNING,
+        AUCTION_ENDED
+    } auction_status;
+    int64_t starting_price;
+    int64_t current_price;
+    int64_t min_increment;
+    char highest_bidder_id[PARTICIPANT_ID_CAPACITY];
+    bool has_bid;
+    struct bid_record {
+        char participant_id[PARTICIPANT_ID_CAPACITY];
+        int64_t amount;
+        time_t timestamp;
+    } bid_history[MAX_BID_HISTORY];
+    size_t bid_count;
 };
 
 struct auction_state {

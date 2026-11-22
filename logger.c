@@ -17,6 +17,9 @@ static const char *message_type_name(uint8_t type)
     case MSG_ROOM_LIST: return "ROOM_LIST";
     case MSG_CREATE_ROOM: return "CREATE_ROOM";
     case MSG_CREATE_ROOM_RESULT: return "CREATE_ROOM_RESULT";
+    case MSG_PLACE_BID: return "PLACE_BID";
+    case MSG_BID_RESULT: return "BID_RESULT";
+    case MSG_BID_UPDATE: return "BID_UPDATE";
     case MSG_ERROR: return "ERROR";
     default: return "UNKNOWN";
     }
@@ -129,7 +132,7 @@ void logger_event(struct logger *logger, const char *level, const char *message)
         return;
     }
     write_timestamp(logger->file);
-    (void)fprintf(logger->file, " pid=%ld component=%s level=%s event=\"",
+    (void)fprintf(logger->file, " pid=%ld component=%s level=%s event=",
                   (long)getpid(), logger->component, level);
     write_escaped_payload(logger->file,
                           &(struct message_header){.payload_length =

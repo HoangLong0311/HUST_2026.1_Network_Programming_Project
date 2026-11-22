@@ -110,6 +110,21 @@ static int receive_response(int socket_fd, uint32_t request_id,
     return 1;
 }
 
+static int receive_push(int socket_fd, char response[RESPONSE_CAPACITY])
+{
+    struct message message;
+
+    if (recv_message(socket_fd, &message) != PROTOCOL_OK ||
+        message.header.request_id != 0U ||
+        message.header.type != MSG_BID_UPDATE ||
+        message.header.payload_length >= RESPONSE_CAPACITY) {
+        return 0;
+    }
+    memcpy(response, message.payload, message.header.payload_length);
+    response[message.header.payload_length] = '\0';
+    return 1;
+}
+
 static int parse_session(const char *response,
                          char participant_id[PARTICIPANT_ID_CAPACITY],
                          char token[SESSION_TOKEN_CAPACITY])
@@ -299,6 +314,18 @@ int main(void)
     CHECK(receive_response(socket_fd, 11U, MSG_ROOM_STATE, response));
     CHECK(strstr(response, "R001|Demo Room|OPEN|P001|1") != NULL);
 
+    CHECK(send_request(socket_fd, MSG_PLACE_BID, 22U,
+                       "R001|A001|100000"));
+    CHECK(receive_response(socket_fd, 22U, MSG_BID_RESULT, response));
+    CHECK(strcmp(response, "OK|R001|100000") == 0);
+    CHECK(receive_push(socket_fd, response));
+    CHECK(strcmp(response, "R001|A001|100000|P001") == 0);
+
+    CHECK(send_request(socket_fd, MSG_PLACE_BID, 23U,
+                       "R001|A001|109999"));
+    CHECK(receive_response(socket_fd, 23U, MSG_BID_RESULT, response));
+    CHECK(strcmp(response, "FAIL|PRICE_TOO_LOW|110000") == 0);
+
     CHECK(send_request(socket_fd, MSG_JOIN_ROOM, 12U, "R002"));
     CHECK(receive_response(socket_fd, 12U, MSG_JOIN_RESULT, response));
     CHECK(strcmp(response, "FAIL|ALREADY_IN_ROOM") == 0);
@@ -326,6 +353,13 @@ int main(void)
     CHECK(strcmp(response, "OK|R001") == 0);
     CHECK(receive_response(second_socket, 17U, MSG_ROOM_STATE, response));
     CHECK(strstr(response, "P002") != NULL);
+
+    CHECK(send_request(second_socket, MSG_PLACE_BID, 24U,
+                       "R001|A001|110000"));
+    CHECK(receive_response(second_socket, 24U, MSG_BID_RESULT, response));
+    CHECK(strcmp(response, "OK|R001|110000") == 0);
+    CHECK(receive_push(second_socket, response));
+    CHECK(strcmp(response, "R001|A001|110000|P002") == 0);
 
     third_socket = connect_to_server(test_port, server_process);
     CHECK(third_socket >= 0);

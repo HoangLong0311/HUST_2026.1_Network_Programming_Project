@@ -7,6 +7,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <inttypes.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -88,7 +91,8 @@ static int receive_response(int socket_fd, uint32_t request_id,
     printf("%s: ", label);
     print_payload(&response);
     if ((expected_type == MSG_JOIN_RESULT ||
-         expected_type == MSG_LEAVE_RESULT) &&
+         expected_type == MSG_LEAVE_RESULT ||
+         expected_type == MSG_BID_RESULT) &&
         response.header.payload_length >= 4U &&
         strncmp((const char *)response.payload, "FAIL", 4U) == 0) {
         return 1;
@@ -111,6 +115,59 @@ static int exchange_request(int socket_fd, uint8_t type, uint32_t request_id,
 static void trim_line_ending(char *text)
 {
     text[strcspn(text, "\r\n")] = '\0';
+}
+
+static int read_live_line(int socket_fd, char *text, size_t capacity)
+{
+    struct pollfd descriptors[2];
+    descriptors[0].fd = STDIN_FILENO;
+    descriptors[0].events = POLLIN;
+    descriptors[1].fd = socket_fd;
+    descriptors[1].events = POLLIN;
+
+    for (;;) {
+        int ready = poll(descriptors, 2, -1);
+        size_t length;
+
+        if (ready < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (descriptors[1].revents & (POLLIN | POLLHUP | POLLERR)) {
+            struct message push;
+            if (recv_message(socket_fd, &push) != PROTOCOL_OK) {
+                return -1;
+            }
+            logger_message(&client_logger, "RECV",
+                           &push.header, push.payload);
+            if (push.header.type == MSG_BID_UPDATE) {
+                printf("\n===== LIVE AUCTION UPDATE =====\n");
+                print_payload(&push);
+                printf("================================\n");
+            }
+            descriptors[1].revents = 0;
+        }
+        if (descriptors[0].revents & POLLIN) {
+            if (fgets(text, (int)capacity, stdin) == NULL) {
+                return 0;
+            }
+            length = strlen(text);
+            if (length == capacity - 1U &&
+                (length == 0U || text[length - 1U] != '\n')) {
+                int character;
+                while ((character = getchar()) != '\n' &&
+                       character != EOF) {
+                }
+                printf("Input qua dai.\n");
+                text[0] = '\0';
+                return 1;
+            }
+            trim_line_ending(text);
+            return 1;
+        }
+    }
 }
 
 static void print_usage(const char *program)
@@ -211,17 +268,27 @@ int main(int argc, char *argv[])
         printf("2. Create room\n");
         printf("3. Join room\n");
         printf("4. Leave room\n");
-        printf("5. View current room\n");
-        printf("6. View room state\n");
-        printf("7. Reconnect help\n");
-        printf("0. Exit\n");
+        printf("5. View room state\n");
+        printf("6. Place bid\n");
+        printf("7. View current room\n");
+        printf("8. Reconnect help\n");
+        printf("9. Exit\n");
         printf("Choose: ");
         fflush(stdout);
-        if (fgets(command, sizeof(command), stdin) == NULL) {
+        request_result = read_live_line(socket_fd, command, sizeof(command));
+        if (request_result == 0) {
             break;
         }
-        trim_line_ending(command);
-        if (strcmp(command, "0") == 0 || strcmp(command, "exit") == 0) {
+        if (request_result < 0) {
+            close(socket_fd);
+            logger_close(&client_logger);
+            return EXIT_FAILURE;
+        }
+        if (request_result > 1) {
+            continue;
+        }
+        if (strcmp(command, "9") == 0 || strcmp(command, "0") == 0 ||
+            strcmp(command, "exit") == 0) {
             break;
         }
 
@@ -302,29 +369,77 @@ int main(int argc, char *argv[])
                                                   "ROOM_STATE");
             }
         } else if (strcmp(command, "5") == 0) {
+            char room_id[ROOM_ID_CAPACITY];
+
+            printf("Room ID: ");
+            fflush(stdout);
+            if (read_live_line(socket_fd, room_id, sizeof(room_id)) <= 0) {
+                continue;
+            }
+            request_result = exchange_request(socket_fd, MSG_GET_ROOM_STATE,
+                                              request_id, room_id,
+                                              strlen(room_id),
+                                              MSG_ROOM_STATE, "ROOM_STATE");
+        } else if (strcmp(command, "7") == 0) {
             if (strcmp(current_room_id, NO_ROOM) == 0) {
                 printf("You are not currently in a room.\n");
             } else {
                 printf("Current room: %s\n", current_room_id);
             }
             continue;
-        } else if (strcmp(command, "6") == 0) {
-            char room_id[ROOM_ID_CAPACITY];
-
-            printf("Room ID: ");
-            fflush(stdout);
-            if (fgets(room_id, sizeof(room_id), stdin) == NULL) {
-                continue;
-            }
-            trim_line_ending(room_id);
-            request_result = exchange_request(socket_fd, MSG_GET_ROOM_STATE,
-                                              request_id, room_id,
-                                              strlen(room_id),
-                                              MSG_ROOM_STATE, "ROOM_STATE");
-        } else if (strcmp(command, "7") == 0) {
+        } else if (strcmp(command, "8") == 0) {
             printf("Reconnect tu terminal moi:\n");
             printf("  ./client --reconnect P001 <session-token>\n");
             continue;
+        } else if (strcmp(command, "6") == 0) {
+            char room_id[ROOM_ID_CAPACITY];
+            char auction_id[AUCTION_ID_CAPACITY];
+            char amount_text[64];
+            char payload[ROOM_ID_CAPACITY + AUCTION_ID_CAPACITY + 80U];
+            char *end;
+            int64_t amount;
+
+            printf("[PLACE BID]\nEnter room ID: ");
+            fflush(stdout);
+            if (read_live_line(socket_fd, room_id, sizeof(room_id)) <= 0) {
+                continue;
+            }
+            printf("Enter auction ID: ");
+            fflush(stdout);
+            if (read_live_line(socket_fd, auction_id,
+                                sizeof(auction_id)) <= 0) {
+                continue;
+            }
+            printf("Enter your bid: ");
+            fflush(stdout);
+            if (read_live_line(socket_fd, amount_text,
+                                sizeof(amount_text)) <= 0) {
+                continue;
+            }
+
+            errno = 0;
+            amount = strtoll(amount_text, &end, 10);
+            if (errno == ERANGE || end == amount_text || *end != '\0' ||
+                amount_text[0] == '-' || amount_text[0] == '+' ||
+                amount <= 0) {
+                printf("INVALID_AMOUNT\n");
+                continue;
+            }
+            if (snprintf(payload, sizeof(payload), "%s|%s|%" PRId64,
+                         room_id, auction_id, amount) >=
+                (int)sizeof(payload)) {
+                printf("Payload khong hop le.\n");
+                continue;
+            }
+            request_result = exchange_request(socket_fd, MSG_PLACE_BID,
+                                              request_id, payload,
+                                              strlen(payload),
+                                              MSG_BID_RESULT, "BID_RESULT");
+            if (request_result == 0) {
+                printf("Bid accepted!\n");
+            } else if (request_result == 1) {
+                printf("Bid rejected.\n");
+            }
         } else {
             printf("Lenh khong hop le.\n");
             continue;

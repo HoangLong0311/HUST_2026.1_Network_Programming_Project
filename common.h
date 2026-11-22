@@ -25,6 +25,9 @@ enum message_type {
     MSG_LEAVE_RESULT = 0x0C,
     MSG_GET_ROOM_STATE = 0x0D,
     MSG_ROOM_STATE = 0x0E,
+    MSG_PLACE_BID = 0x15,
+    MSG_BID_RESULT = 0x16,
+    MSG_BID_UPDATE = 0x17,
     MSG_ERROR = 0x14
 };
 

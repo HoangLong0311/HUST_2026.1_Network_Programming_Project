@@ -126,6 +126,14 @@ static void add_default_room(struct auction_state *state, const char *name)
     (void)snprintf(room->owner_id, sizeof(room->owner_id), "%s", "SYSTEM");
     room->participant_count = 0;
     room->ended = false;
+    (void)snprintf(room->auction_id, sizeof(room->auction_id), "A001");
+    room->auction_status = AUCTION_RUNNING;
+    room->starting_price = 100000;
+    room->current_price = 0;
+    room->min_increment = 10000;
+    room->has_bid = false;
+    room->bid_count = 0;
+    room->highest_bidder_id[0] = '\0';
 }
 
 void auction_state_init(struct auction_state *state)
@@ -244,6 +252,14 @@ enum state_result auction_room_create(struct auction_state *state,
                    owner->id);
     new_room->participant_count = 0;
     new_room->ended = false;
+    (void)snprintf(new_room->auction_id, sizeof(new_room->auction_id), "A001");
+    new_room->auction_status = AUCTION_RUNNING;
+    new_room->starting_price = 100000;
+    new_room->current_price = 0;
+    new_room->min_increment = 10000;
+    new_room->has_bid = false;
+    new_room->bid_count = 0;
+    new_room->highest_bidder_id[0] = '\0';
     *room = new_room;
     return STATE_OK;
 }
