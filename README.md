@@ -1,10 +1,11 @@
-# Online Auction - G3 & G4
+# Online Auction - G3, G4 & G5
 
 Đây là chương trình TCP socket bằng C trên Linux, biên dịch bằng GCC. Bản
 hiện tại mở rộng Protocol V1 với:
 
 - **G3:** participant, `CONNECT`, session token và `RECONNECT`.
 - **G4:** danh sách phòng đấu giá trong bộ nhớ và `CREATE_ROOM`.
+- **G5:** JOIN_ROOM, LEAVE_ROOM, membership hai chiều và room state.
 
 Chưa triển khai `JOIN`/`LEAVE`, đặt giá, timer, lưu dữ liệu lâu dài hoặc
 multithreading. Server dùng `poll()` để phục vụ nhiều client trong một tiến
@@ -16,7 +17,7 @@ trình; mỗi request vẫn được xử lý tuần tự trong event loop.
 - `protocol.h`, `protocol.c`: đóng gói/giải mã frame TCP và xử lý partial
   I/O.
 - `auction_state.h`, `auction_state.c`: quản lý participant, token và phòng
-  trong bộ nhớ.
+  trong bộ nhớ, bao gồm membership và `current_room_id`.
 - `server.c`: socket server, xác thực request và điều phối state.
 - `client.c`: client tương tác dòng lệnh, hỗ trợ connect/reconnect và các lệnh
   phòng.
@@ -47,6 +48,8 @@ make clean
 2. test tạo participant, disconnect/reconnect, token và phòng;
 3. test server thật, quyền truy cập trước `CONNECT`, request ID, reconnect,
    tạo phòng và liệt kê phòng.
+4. test membership: join/leave, room khác, not-in-room, room mismatch,
+   room ended và room full.
 
 ## Chạy chương trình
 
@@ -89,6 +92,24 @@ LIST_ROOMS
 CREATE_ROOM Sunday Auction
 exit
 ```
+
+Hoặc dùng menu tương tác:
+
+```text
+===== ONLINE AUCTION CLIENT =====
+1. List rooms
+2. Create room
+3. Join room
+4. Leave room
+5. View current room
+6. View room state
+7. Reconnect help
+0. Exit
+```
+
+Khi join thành công, server trả `JOIN_RESULT` rồi `ROOM_STATE`. Client chỉ
+cập nhật room local sau khi nhận `OK|<room-id>`; server là nguồn dữ liệu
+authoritative.
 
 Server khởi tạo sẵn `R001|Demo Room` và `R002|Practice Room`. Mỗi phòng mới
 được cấp ID tăng dần; tên phòng trùng bị từ chối. Participant, token và phòng
@@ -159,10 +180,20 @@ không đáng tin cậy.
 | `ROOM_LIST` | `0x06` | — | Mỗi dòng `<room-id>|<room-name>` |
 | `CREATE_ROOM` | `0x07` | Tên phòng | `CREATE_ROOM_RESULT` |
 | `CREATE_ROOM_RESULT` | `0x08` | — | `OK|<room-id>|<room-name>` |
+| `JOIN_ROOM` | `0x09` | `<room-id>` | `JOIN_RESULT` |
+| `JOIN_RESULT` | `0x0A` | — | `OK|<room-id>` hoặc `FAIL|<reason>` |
+| `LEAVE_ROOM` | `0x0B` | `<room-id>` | `LEAVE_RESULT` |
+| `LEAVE_RESULT` | `0x0C` | — | `OK|<room-id>` hoặc `FAIL|<reason>` |
+| `GET_ROOM_STATE` | `0x0D` | `<room-id>` | `ROOM_STATE` |
+| `ROOM_STATE` | `0x0E` | — | `<room-id>\|<name>\|<OPEN/ENDED>\|<participant-list>\|<count>` |
 | `ERROR` | `0x14` | — | Mã lỗi dạng text |
 
 Mọi response ứng với request đều echo đúng `request_id`. Message tự gửi
 không có trong phiên bản hiện tại; nếu có thì dùng `request_id = 0`.
+
+0x07/0x08 đã được giữ cho G4 `CREATE_ROOM/CREATE_ROOM_RESULT`. Vì vậy G5 dùng
+0x0D/0x0E mới cho `GET_ROOM_STATE/ROOM_STATE`, không làm thay đổi semantic G4
+và không dùng lại mã hiện có. JOIN/LEAVE dùng đúng 0x09–0x0C.
 
 Các mã lỗi chính gồm:
 
@@ -175,6 +206,13 @@ Các mã lỗi chính gồm:
 - `ROOM_NAME_EXISTS`
 - `INVALID_ROOM_NAME`
 - `UNEXPECTED_PAYLOAD`
+- `ROOM_NOT_FOUND`
+- `ALREADY_IN_ROOM`
+- `ROOM_ENDED`
+- `ROOM_FULL`
+- `NOT_IN_ROOM`
+- `ROOM_MISMATCH`
+- `INVALID_ROOM_ID`
 - `UNKNOWN_MESSAGE_TYPE`
 - `INTERNAL_ERROR`
 
@@ -199,3 +237,18 @@ LF, và phải nằm trong giới hạn buffer được định nghĩa ở `auct
 - Giới hạn hiện tại là 64 client đồng thời; kết nối vượt giới hạn bị từ chối.
 - Chưa có multithreading. Payload phản hồi tối đa 4096 byte được gửi đồng bộ;
   ứng dụng tải lớn hơn cần thêm output queue và theo dõi `POLLOUT`.
+
+## G5 - JOIN_ROOM / LEAVE_ROOM
+
+- Một participant chỉ tham gia tối đa một room; `participant.current_room_id`
+  dùng `NO_ROOM` là `-1`.
+- `JOIN_ROOM` xác định participant theo socket/session, không tin room hoặc
+  participant ID do payload của client khai báo.
+- Room lưu `participant_ids[]`, `participant_count` và trạng thái `ended`.
+- JOIN thành công cập nhật đồng thời room membership và
+  `participant.current_room_id`, rồi gửi `JOIN_RESULT` và `ROOM_STATE`.
+- LEAVE chỉ xóa membership; participant không bị xóa khỏi Participant Manager,
+  bid history chưa tồn tại ở G5 và room không tự kết thúc.
+- Disconnect không phải leave: membership và `current_room_id` được giữ. Khi
+  reconnect, socket mới được gắn vào participant cũ.
+- Room có tối đa `32` participant (`MAX_PARTICIPANTS_PER_ROOM`).
