@@ -51,6 +51,32 @@ static int send_error(int socket_fd, uint32_t request_id, const char *code)
     return send_text(socket_fd, MSG_ERROR, request_id, code);
 }
 
+static int send_join_failure(int socket_fd, uint32_t request_id,
+                             const struct participant *participant,
+                             const char *room_id, const char *reason)
+{
+    char payload[128];
+    char event[160];
+    int written;
+
+    written = snprintf(payload, sizeof(payload), "FAIL|%s", reason);
+    if (written < 0 || (size_t)written >= sizeof(payload)) {
+        return PROTOCOL_ERROR;
+    }
+    if (participant == NULL) {
+        (void)snprintf(event, sizeof(event),
+                       "[JOIN FAILED] UNKNOWN %s %s",
+                       reason, room_id == NULL ? "-" : room_id);
+    } else {
+        (void)snprintf(event, sizeof(event),
+                        "[JOIN FAILED] %s %s %s",
+                        participant->id, reason,
+                        room_id == NULL ? "-" : room_id);
+    }
+    logger_event(&server_logger, "INFO", event);
+    return send_text(socket_fd, MSG_JOIN_RESULT, request_id, payload);
+}
+
 static int payload_to_text(const struct message *message, char *destination,
                            size_t destination_capacity, int allow_empty,
                            int allow_pipe)
@@ -144,6 +170,42 @@ static int send_room_list(int socket_fd, uint32_t request_id,
     }
 
     return send_payload(socket_fd, MSG_ROOM_LIST, request_id, payload, used);
+}
+
+static int send_room_state(int socket_fd, uint32_t request_id,
+                           const struct auction_room *room)
+{
+    char payload[PROTOCOL_MAX_PAYLOAD];
+    size_t used;
+    size_t index;
+    int written;
+
+    if (room == NULL) {
+        return PROTOCOL_ERROR;
+    }
+    written = snprintf(payload, sizeof(payload), "%s|%s|%s|",
+                       room->id, room->name,
+                       room->ended ? "ENDED" : "OPEN");
+    if (written < 0 || (size_t)written >= sizeof(payload)) {
+        return PROTOCOL_ERROR;
+    }
+    used = (size_t)written;
+    for (index = 0; index < room->participant_count; index++) {
+        written = snprintf(payload + used, sizeof(payload) - used,
+                           "%s%s", index == 0U ? "" : ",",
+                           room->participant_ids[index]);
+        if (written < 0 || (size_t)written >= sizeof(payload) - used) {
+            return PROTOCOL_ERROR;
+        }
+        used += (size_t)written;
+    }
+    written = snprintf(payload + used, sizeof(payload) - used,
+                       "|%zu", room->participant_count);
+    if (written < 0 || (size_t)written >= sizeof(payload) - used) {
+        return PROTOCOL_ERROR;
+    }
+    used += (size_t)written;
+    return send_payload(socket_fd, MSG_ROOM_STATE, request_id, payload, used);
 }
 
 static int handle_connect(int socket_fd, const struct message *message,
@@ -264,6 +326,168 @@ static int handle_create_room(int socket_fd, const struct message *message,
                      message->header.request_id, payload);
 }
 
+static int handle_join_room(int socket_fd, const struct message *message,
+                            struct auction_state *state,
+                            struct participant *current_participant)
+{
+    char room_id[ROOM_ID_CAPACITY];
+    struct auction_room *room;
+    enum state_result result;
+
+    if (current_participant == NULL) {
+        return send_text(socket_fd, MSG_JOIN_RESULT,
+                         message->header.request_id,
+                         "FAIL|INVALID_PARTICIPANT");
+    }
+    if (payload_to_text(message, room_id, sizeof(room_id), 0, 0) != 0 ||
+        strlen(room_id) < 4U) {
+        return send_text(socket_fd, MSG_JOIN_RESULT,
+                         message->header.request_id,
+                         "FAIL|INVALID_PARTICIPANT");
+    }
+
+    result = auction_room_join(state, current_participant, room_id);
+    switch (result) {
+    case STATE_NOT_FOUND:
+        return send_join_failure(socket_fd, message->header.request_id,
+                                 current_participant, room_id,
+                                 "ROOM_NOT_FOUND");
+    case STATE_ALREADY_CONNECTED:
+        return send_join_failure(socket_fd, message->header.request_id,
+                                 current_participant, room_id,
+                                 "ALREADY_IN_ROOM");
+    case STATE_ROOM_ENDED:
+        return send_join_failure(socket_fd, message->header.request_id,
+                                 current_participant, room_id,
+                                 "ROOM_ENDED");
+    case STATE_ROOM_FULL:
+        return send_join_failure(socket_fd, message->header.request_id,
+                                 current_participant, room_id,
+                                 "ROOM_FULL");
+    case STATE_INVALID_ARGUMENT:
+        return send_text(socket_fd, MSG_JOIN_RESULT,
+                         message->header.request_id,
+                         "FAIL|INVALID_PARTICIPANT");
+    case STATE_INTERNAL_ERROR:
+        return send_text(socket_fd, MSG_JOIN_RESULT,
+                         message->header.request_id, "FAIL|SERVER_ERROR");
+    default:
+        break;
+    }
+
+    if (result != STATE_OK) {
+        return send_text(socket_fd, MSG_JOIN_RESULT,
+                         message->header.request_id, "FAIL|SERVER_ERROR");
+    }
+    room = auction_room_find(state, room_id);
+    if (room == NULL) {
+        return PROTOCOL_ERROR;
+    }
+    {
+        char joined_payload[ROOM_ID_CAPACITY + 3U];
+        int written = snprintf(joined_payload, sizeof(joined_payload),
+                               "OK|%s", room_id);
+        if (written < 0 || (size_t)written >= sizeof(joined_payload)) {
+            return PROTOCOL_ERROR;
+        }
+        if (send_text(socket_fd, MSG_JOIN_RESULT, message->header.request_id,
+                      joined_payload) != PROTOCOL_OK) {
+            return PROTOCOL_ERROR;
+        }
+    }
+    {
+        char event[128];
+        (void)snprintf(event, sizeof(event), "[JOIN] %s joined %s",
+                       current_participant->id, room_id);
+        logger_event(&server_logger, "INFO", event);
+    }
+    return send_room_state(socket_fd, message->header.request_id, room);
+}
+
+static int handle_leave_room(int socket_fd, const struct message *message,
+                             struct auction_state *state,
+                             struct participant *current_participant)
+{
+    char room_id[ROOM_ID_CAPACITY];
+    enum state_result result;
+
+    if (current_participant == NULL) {
+        return send_text(socket_fd, MSG_LEAVE_RESULT,
+                         message->header.request_id,
+                         "FAIL|INVALID_PARTICIPANT");
+    }
+    if (payload_to_text(message, room_id, sizeof(room_id), 0, 0) != 0 ||
+        strlen(room_id) < 4U) {
+        return send_text(socket_fd, MSG_LEAVE_RESULT,
+                         message->header.request_id,
+                         "FAIL|INVALID_PARTICIPANT");
+    }
+
+    result = auction_room_leave(state, current_participant, room_id);
+    switch (result) {
+    case STATE_NOT_IN_ROOM:
+        {
+            char event[128];
+            (void)snprintf(event, sizeof(event),
+                           "[LEAVE FAILED] %s NOT_IN_ROOM",
+                           current_participant->id);
+            logger_event(&server_logger, "INFO", event);
+            return send_text(socket_fd, MSG_LEAVE_RESULT,
+                             message->header.request_id,
+                             "FAIL|NOT_IN_ROOM");
+        }
+    case STATE_ROOM_MISMATCH:
+        {
+            char event[128];
+            (void)snprintf(event, sizeof(event),
+                           "[LEAVE FAILED] %s ROOM_MISMATCH %s",
+                           current_participant->id, room_id);
+            logger_event(&server_logger, "INFO", event);
+            return send_text(socket_fd, MSG_LEAVE_RESULT,
+                             message->header.request_id,
+                             "FAIL|ROOM_MISMATCH");
+        }
+    case STATE_INVALID_ARGUMENT:
+        return send_text(socket_fd, MSG_LEAVE_RESULT,
+                         message->header.request_id,
+                         "FAIL|INVALID_PARTICIPANT");
+    case STATE_INTERNAL_ERROR:
+        return send_text(socket_fd, MSG_LEAVE_RESULT,
+                         message->header.request_id, "FAIL|SERVER_ERROR");
+    default:
+        break;
+    }
+    if (result != STATE_OK) {
+        return send_text(socket_fd, MSG_LEAVE_RESULT,
+                         message->header.request_id, "FAIL|SERVER_ERROR");
+    }
+
+    {
+        char left_payload[ROOM_ID_CAPACITY + 3U];
+        const struct auction_room *room;
+        int written = snprintf(left_payload, sizeof(left_payload),
+                               "OK|%s", room_id);
+        if (written < 0 || (size_t)written >= sizeof(left_payload)) {
+            return PROTOCOL_ERROR;
+        }
+        if (send_text(socket_fd, MSG_LEAVE_RESULT, message->header.request_id,
+                      left_payload) != PROTOCOL_OK) {
+            return PROTOCOL_ERROR;
+        }
+        {
+            char event[128];
+            (void)snprintf(event, sizeof(event), "[LEAVE] %s left %s",
+                           current_participant->id, room_id);
+            logger_event(&server_logger, "INFO", event);
+        }
+        room = auction_room_find_const(state, room_id);
+        if (room != NULL) {
+            return send_room_state(socket_fd, message->header.request_id, room);
+        }
+    }
+    return PROTOCOL_OK;
+}
+
 struct client_connection {
     int socket_fd;
     size_t input_length;
@@ -305,6 +529,41 @@ static int process_message(struct client_connection *client,
         response_result = handle_create_room(client->socket_fd, message, state,
                                              client->participant);
         break;
+    case MSG_JOIN_ROOM:
+        response_result = handle_join_room(client->socket_fd, message, state,
+                                           client->participant);
+        break;
+    case MSG_LEAVE_ROOM:
+        response_result = handle_leave_room(client->socket_fd, message, state,
+                                            client->participant);
+        break;
+    case MSG_GET_ROOM_STATE: {
+        char room_id[ROOM_ID_CAPACITY];
+        const struct auction_room *room;
+
+        if (client->participant == NULL) {
+            response_result = send_error(client->socket_fd,
+                                         message->header.request_id,
+                                         "INVALID_PARTICIPANT");
+        } else if (payload_to_text(message, room_id, sizeof(room_id),
+                                   0, 0) != 0) {
+            response_result = send_error(client->socket_fd,
+                                         message->header.request_id,
+                                         "INVALID_ROOM_ID");
+        } else {
+            room = auction_room_find_const(state, room_id);
+            if (room == NULL) {
+                response_result = send_error(client->socket_fd,
+                                             message->header.request_id,
+                                             "ROOM_NOT_FOUND");
+            } else {
+                response_result = send_room_state(client->socket_fd,
+                                                  message->header.request_id,
+                                                  room);
+            }
+        }
+        break;
+    }
     default:
         response_result = send_error(client->socket_fd,
                                      message->header.request_id,
@@ -391,6 +650,14 @@ static int read_client(struct client_connection *client,
 
 static void close_client(struct client_connection *client)
 {
+    if (client->participant != NULL) {
+        char event[160];
+        (void)snprintf(event, sizeof(event),
+                       "[DISCONNECT] %s disconnected, membership preserved %s",
+                       client->participant->id,
+                       client->participant->current_room_id);
+        logger_event(&server_logger, "INFO", event);
+    }
     if (client->socket_fd >= 0) {
         close(client->socket_fd);
     }

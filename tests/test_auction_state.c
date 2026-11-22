@@ -78,10 +78,60 @@ static void test_multiple_rooms_are_managed_in_memory(void)
            STATE_INVALID_ARGUMENT);
 }
 
+static void test_join_leave_membership(void)
+{
+    struct auction_state state;
+    struct participant *alice;
+    struct participant *bob;
+    struct participant *carol;
+    struct auction_room *room1;
+    struct auction_room *room2;
+
+    auction_state_init(&state);
+    assert(participant_connect(&state, "Alice", &alice) == STATE_OK);
+    assert(participant_connect(&state, "Bob", &bob) == STATE_OK);
+    room1 = auction_room_find(&state, "R001");
+    room2 = auction_room_find(&state, "R002");
+    assert(room1 != NULL && room2 != NULL);
+
+    assert(strcmp(alice->current_room_id, NO_ROOM) == 0);
+    assert(auction_room_join(&state, alice, "R001") == STATE_OK);
+    assert(room1->participant_count == 1U);
+    assert(strcmp(room1->participant_ids[0], "P001") == 0);
+    assert(strcmp(alice->current_room_id, "R001") == 0);
+
+    assert(auction_room_join(&state, alice, "R002") ==
+           STATE_ALREADY_CONNECTED);
+    assert(strcmp(alice->current_room_id, "R001") == 0);
+    assert(auction_room_join(&state, bob, "R001") == STATE_OK);
+    assert(room1->participant_count == 2U);
+
+    assert(auction_room_join(&state, alice, "R999") == STATE_NOT_FOUND);
+    assert(participant_connect(&state, "Carol", &carol) == STATE_OK);
+    room2->ended = true;
+    assert(auction_room_join(&state, carol, "R002") == STATE_ROOM_ENDED);
+
+    assert(auction_room_leave(&state, alice, "R002") ==
+           STATE_ROOM_MISMATCH);
+    assert(strcmp(alice->current_room_id, "R001") == 0);
+    assert(auction_room_leave(&state, alice, "R001") == STATE_OK);
+    assert(room1->participant_count == 1U);
+    assert(strcmp(alice->current_room_id, NO_ROOM) == 0);
+    assert(auction_room_leave(&state, alice, "R001") == STATE_NOT_IN_ROOM);
+
+    participant_disconnect(bob);
+    assert(room1->participant_count == 1U);
+    assert(strcmp(bob->current_room_id, "R001") == 0);
+
+    room1->participant_count = MAX_PARTICIPANTS_PER_ROOM;
+    assert(auction_room_join(&state, alice, "R001") == STATE_ROOM_FULL);
+}
+
 int main(void)
 {
     test_connect_disconnect_and_reconnect();
     test_multiple_rooms_are_managed_in_memory();
+    test_join_leave_membership();
     puts("auction state tests passed");
     return 0;
 }
