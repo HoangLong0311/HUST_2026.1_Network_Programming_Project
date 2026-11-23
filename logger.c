@@ -20,6 +20,9 @@ static const char *message_type_name(uint8_t type)
     case MSG_PLACE_BID: return "PLACE_BID";
     case MSG_BID_RESULT: return "BID_RESULT";
     case MSG_BID_UPDATE: return "BID_UPDATE";
+    case MSG_TIME_UPDATE: return "TIME_UPDATE";
+    case MSG_TIME_WARNING: return "TIME_WARNING";
+    case MSG_AUCTION_RESULT: return "AUCTION_RESULT";
     case MSG_ERROR: return "ERROR";
     default: return "UNKNOWN";
     }
@@ -51,20 +54,15 @@ static void write_escaped_payload(FILE *file, const struct message_header *heade
 {
     uint32_t index;
     int redact_token = payload_is_token_message(header->type);
-    int redact_after_separator = header->type == MSG_RECONNECT ? 1 : 2;
-    int separator_count = 0;
-
     (void)fputc('"', file);
+    /* Even malformed credentials must never be written to the log. */
+    if (redact_token) {
+        (void)fputs("<REDACTED>\"", file);
+        return;
+    }
     for (index = 0; index < header->payload_length; index++) {
         uint8_t byte = payload[index];
 
-        if (redact_token && separator_count >= redact_after_separator) {
-            (void)fputs("<REDACTED>", file);
-            break;
-        }
-        if (redact_token && byte == (uint8_t)'|') {
-            separator_count++;
-        }
         if (byte == '\\' || byte == '"') {
             (void)fprintf(file, "\\%c", byte);
         } else if (byte == '\n') {

@@ -61,18 +61,39 @@ static void print_payload(const struct message *message)
            (const char *)message->payload);
 }
 
+static int print_notification(const struct message *message)
+{
+    const char *label;
+
+    if (message->header.request_id != 0U) return 0;
+    switch (message->header.type) {
+    case MSG_BID_UPDATE: label = "BID_UPDATE"; break;
+    case MSG_TIME_UPDATE: label = "TIME_UPDATE"; break;
+    case MSG_TIME_WARNING: label = "TIME_WARNING"; break;
+    case MSG_AUCTION_RESULT: label = "AUCTION_RESULT"; break;
+    default: return 0;
+    }
+    printf("\n%s: ", label);
+    print_payload(message);
+    fflush(stdout);
+    return 1;
+}
+
 /* Returns 0 for the expected response, 1 for a server error, and -1 for I/O. */
-static int receive_response(int socket_fd, uint32_t request_id,
-                            uint8_t expected_type, const char *label)
+static int receive_response_copy(int socket_fd, uint32_t request_id,
+                                 uint8_t expected_type, const char *label,
+                                 char *payload, size_t payload_capacity)
 {
     struct message response;
 
-    if (recv_message(socket_fd, &response) != PROTOCOL_OK) {
-        logger_event(&client_logger, "ERROR", "receive frame failed");
-        fprintf(stderr, "Khong the nhan phan hoi tu server.\n");
-        return -1;
-    }
-    logger_message(&client_logger, "RECV", &response.header, response.payload);
+    do {
+        if (recv_message(socket_fd, &response) != PROTOCOL_OK) {
+            logger_event(&client_logger, "ERROR", "receive frame failed");
+            fprintf(stderr, "Khong the nhan phan hoi tu server.\n");
+            return -1;
+        }
+        logger_message(&client_logger, "RECV", &response.header, response.payload);
+    } while (print_notification(&response));
     if (response.header.request_id != request_id) {
         fprintf(stderr, "request_id phan hoi khong khop.\n");
         return -1;
@@ -88,6 +109,16 @@ static int receive_response(int socket_fd, uint32_t request_id,
         return -1;
     }
 
+    if (payload != NULL) {
+        if (payload_capacity == 0U ||
+            response.header.payload_length >= payload_capacity) {
+            fprintf(stderr, "Payload phan hoi qua dai.\n");
+            return -1;
+        }
+        memcpy(payload, response.payload, response.header.payload_length);
+        payload[response.header.payload_length] = '\0';
+    }
+
     printf("%s: ", label);
     print_payload(&response);
     if ((expected_type == MSG_JOIN_RESULT ||
@@ -100,6 +131,13 @@ static int receive_response(int socket_fd, uint32_t request_id,
     return 0;
 }
 
+static int receive_response(int socket_fd, uint32_t request_id,
+                            uint8_t expected_type, const char *label)
+{
+    return receive_response_copy(socket_fd, request_id, expected_type, label,
+                                 NULL, 0U);
+}
+
 static int exchange_request(int socket_fd, uint8_t type, uint32_t request_id,
                             const void *payload, size_t payload_length,
                             uint8_t expected_type, const char *label)
@@ -110,6 +148,62 @@ static int exchange_request(int socket_fd, uint8_t type, uint32_t request_id,
         return -1;
     }
     return receive_response(socket_fd, request_id, expected_type, label);
+}
+
+static int exchange_request_copy(int socket_fd, uint8_t type,
+                                 uint32_t request_id,
+                                 const void *payload, size_t payload_length,
+                                 uint8_t expected_type, const char *label,
+                                 char *response, size_t response_capacity)
+{
+    if (send_request(socket_fd, type, request_id, payload, payload_length) !=
+        PROTOCOL_OK) {
+        fprintf(stderr, "Khong the gui yeu cau den server.\n");
+        return -1;
+    }
+    return receive_response_copy(socket_fd, request_id, expected_type, label,
+                                 response, response_capacity);
+}
+
+static int request_auction_state(int socket_fd, uint32_t request_id,
+                                 const char *room_id)
+{
+    return exchange_request(socket_fd, MSG_GET_AUCTION_STATE, request_id,
+                            room_id, strlen(room_id), MSG_AUCTION_STATE,
+                            "AUCTION_STATE");
+}
+
+static int synchronize_session(int socket_fd, uint32_t *request_id,
+                               char current_room_id[ROOM_ID_CAPACITY])
+{
+    char response[ROOM_ID_CAPACITY + 3U];
+    const char *room_id;
+    int result;
+
+    (*request_id)++;
+    result = exchange_request_copy(socket_fd, MSG_GET_SESSION_STATE,
+                                   *request_id, NULL, 0U,
+                                   MSG_SESSION_STATE, "SESSION_STATE",
+                                   response, sizeof(response));
+    if (result != 0) {
+        return result;
+    }
+    if (strncmp(response, "OK|", 3U) != 0) {
+        fprintf(stderr, "SESSION_STATE khong hop le.\n");
+        return -1;
+    }
+    room_id = response + 3U;
+    if (!is_safe_text(room_id, ROOM_ID_CAPACITY, 0)) {
+        fprintf(stderr, "Room ID trong SESSION_STATE khong hop le.\n");
+        return -1;
+    }
+    (void)snprintf(current_room_id, ROOM_ID_CAPACITY, "%s", room_id);
+    if (strcmp(current_room_id, NO_ROOM) == 0) {
+        return 0;
+    }
+
+    (*request_id)++;
+    return request_auction_state(socket_fd, *request_id, current_room_id);
 }
 
 static void trim_line_ending(char *text)
@@ -142,14 +236,13 @@ static int read_live_line(int socket_fd, char *text, size_t capacity)
             }
             logger_message(&client_logger, "RECV",
                            &push.header, push.payload);
-            if (push.header.type == MSG_BID_UPDATE) {
-                printf("\n===== LIVE AUCTION UPDATE =====\n");
-                print_payload(&push);
-                printf("================================\n");
+            if (!print_notification(&push)) {
+                fprintf(stderr, "Nhan duoc message khong mong doi.\n");
+                return -1;
             }
             descriptors[1].revents = 0;
         }
-        if (descriptors[0].revents & POLLIN) {
+        if (descriptors[0].revents & (POLLIN | POLLHUP)) {
             if (fgets(text, (int)capacity, stdin) == NULL) {
                 return 0;
             }
@@ -224,6 +317,7 @@ int main(int argc, char *argv[])
     }
 
     signal(SIGPIPE, SIG_IGN);
+    (void)setvbuf(stdin, NULL, _IONBF, 0);
     if (logger_open(&client_logger, "auction.log", "CLIENT") != 0) {
         perror("auction.log");
         return EXIT_FAILURE;
@@ -253,6 +347,13 @@ int main(int argc, char *argv[])
                                       initial_type == MSG_CONNECT
                                           ? "CONNECT_RESULT"
                                           : "RECONNECT_RESULT");
+    if (request_result != 0) {
+        close(socket_fd);
+        logger_close(&client_logger);
+        return EXIT_FAILURE;
+    }
+    request_result = synchronize_session(socket_fd, &request_id,
+                                         current_room_id);
     if (request_result != 0) {
         close(socket_fd);
         logger_close(&client_logger);
@@ -302,10 +403,7 @@ int main(int argc, char *argv[])
 
             printf("Room name: ");
             fflush(stdout);
-            if (fgets(room_name_input, sizeof(room_name_input), stdin) == NULL) {
-                continue;
-            }
-            trim_line_ending(room_name_input);
+            if (read_live_line(socket_fd, room_name_input, sizeof(room_name_input)) <= 0) break;
             room_name = room_name_input;
             if (!is_safe_text(room_name, ROOM_NAME_CAPACITY, 0)) {
                 printf("Ten phong khong hop le.\n");
@@ -321,10 +419,7 @@ int main(int argc, char *argv[])
 
             printf("[JOIN ROOM]\nRoom ID: ");
             fflush(stdout);
-            if (fgets(room_id, sizeof(room_id), stdin) == NULL) {
-                continue;
-            }
-            trim_line_ending(room_id);
+            if (read_live_line(socket_fd, room_id, sizeof(room_id)) <= 0) break;
             if (!is_safe_text(room_id, ROOM_ID_CAPACITY, 0)) {
                 printf("Room ID khong hop le.\n");
                 continue;
@@ -342,6 +437,12 @@ int main(int argc, char *argv[])
                 request_result = receive_response(socket_fd, request_id,
                                                   MSG_ROOM_STATE,
                                                   "ROOM_STATE");
+                if (request_result == 0) {
+                    request_id++;
+                    request_result = request_auction_state(socket_fd,
+                                                           request_id,
+                                                           current_room_id);
+                }
             } else if (request_result == 1) {
                 printf("Join room failed.\n");
             }
@@ -385,6 +486,13 @@ int main(int argc, char *argv[])
                 printf("You are not currently in a room.\n");
             } else {
                 printf("Current room: %s\n", current_room_id);
+                request_result = request_auction_state(socket_fd, request_id,
+                                                       current_room_id);
+                if (request_result < 0) {
+                    close(socket_fd);
+                    logger_close(&client_logger);
+                    return EXIT_FAILURE;
+                }
             }
             continue;
         } else if (strcmp(command, "8") == 0) {

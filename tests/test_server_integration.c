@@ -99,8 +99,12 @@ static int receive_response(int socket_fd, uint32_t request_id,
 {
     struct message message;
 
-    if (recv_message(socket_fd, &message) != PROTOCOL_OK ||
-        message.header.request_id != request_id ||
+    do {
+        if (recv_message(socket_fd, &message) != PROTOCOL_OK) return 0;
+    } while (message.header.request_id == 0U &&
+             (message.header.type == MSG_TIME_UPDATE ||
+              message.header.type == MSG_TIME_WARNING));
+    if (message.header.request_id != request_id ||
         message.header.type != expected_type ||
         message.header.payload_length >= RESPONSE_CAPACITY) {
         return 0;
@@ -114,8 +118,12 @@ static int receive_push(int socket_fd, char response[RESPONSE_CAPACITY])
 {
     struct message message;
 
-    if (recv_message(socket_fd, &message) != PROTOCOL_OK ||
-        message.header.request_id != 0U ||
+    do {
+        if (recv_message(socket_fd, &message) != PROTOCOL_OK) return 0;
+    } while (message.header.request_id == 0U &&
+             (message.header.type == MSG_TIME_UPDATE ||
+              message.header.type == MSG_TIME_WARNING));
+    if (message.header.request_id != 0U ||
         message.header.type != MSG_BID_UPDATE ||
         message.header.payload_length >= RESPONSE_CAPACITY) {
         return 0;
@@ -150,9 +158,9 @@ static int parse_session(const char *response,
         strlen(token_start + 1) >= SESSION_TOKEN_CAPACITY) {
         return 0;
     }
-    (void)snprintf(participant_id, PARTICIPANT_ID_CAPACITY, "%s",
-                   participant_id_start);
-    (void)snprintf(token, SESSION_TOKEN_CAPACITY, "%s", token_start + 1);
+    memcpy(participant_id, participant_id_start,
+           strlen(participant_id_start) + 1U);
+    memcpy(token, token_start + 1, strlen(token_start + 1) + 1U);
     return 1;
 }
 
@@ -229,9 +237,11 @@ int main(void)
     char participant_id[PARTICIPANT_ID_CAPACITY];
     char token[SESSION_TOKEN_CAPACITY];
     char reconnect_payload[PARTICIPANT_ID_CAPACITY + SESSION_TOKEN_CAPACITY];
+    char oversized_bid[128];
     int socket_fd = -1;
     int second_socket = -1;
     int third_socket = -1;
+    int takeover_socket = -1;
     int server_output = -1;
     int exit_status = EXIT_FAILURE;
     uint16_t test_port = 0;
@@ -245,6 +255,9 @@ int main(void)
     CHECK(send_request(socket_fd, MSG_LIST_ROOMS, 1U, NULL));
     CHECK(receive_response(socket_fd, 1U, MSG_ERROR, response));
     CHECK(strcmp(response, "NOT_CONNECTED") == 0);
+    CHECK(send_request(socket_fd, MSG_GET_SESSION_STATE, 101U, NULL));
+    CHECK(receive_response(socket_fd, 101U, MSG_ERROR, response));
+    CHECK(strcmp(response, "NOT_CONNECTED") == 0);
 
     CHECK(send_request(socket_fd, MSG_CONNECT, 2U, "Alice"));
     CHECK(receive_response(socket_fd, 2U, MSG_CONNECT_RESULT, response));
@@ -252,6 +265,12 @@ int main(void)
     CHECK(strcmp(participant_id, "P001") == 0);
     CHECK(strlen(token) == SESSION_TOKEN_CAPACITY - 1U);
     (void)snprintf(initial_session, sizeof(initial_session), "%s", response);
+    CHECK(send_request(socket_fd, MSG_GET_SESSION_STATE, 102U, NULL));
+    CHECK(receive_response(socket_fd, 102U, MSG_SESSION_STATE, response));
+    CHECK(strcmp(response, "OK|-1") == 0);
+    CHECK(send_request(socket_fd, MSG_GET_AUCTION_STATE, 103U, "R001"));
+    CHECK(receive_response(socket_fd, 103U, MSG_ERROR, response));
+    CHECK(strcmp(response, "NOT_IN_ROOM") == 0);
     (void)close(socket_fd);
     socket_fd = -1;
 
@@ -313,6 +332,27 @@ int main(void)
     CHECK(strcmp(response, "OK|R001") == 0);
     CHECK(receive_response(socket_fd, 11U, MSG_ROOM_STATE, response));
     CHECK(strstr(response, "R001|Demo Room|OPEN|P001|1") != NULL);
+    CHECK(send_request(socket_fd, MSG_GET_SESSION_STATE, 104U, NULL));
+    CHECK(receive_response(socket_fd, 104U, MSG_SESSION_STATE, response));
+    CHECK(strcmp(response, "OK|R001") == 0);
+    CHECK(send_request(socket_fd, MSG_GET_AUCTION_STATE, 105U, "R002"));
+    CHECK(receive_response(socket_fd, 105U, MSG_ERROR, response));
+    CHECK(strcmp(response, "ROOM_MISMATCH") == 0);
+
+    /* An amount whose first 63 characters form 100000 must not be truncated
+       into an accepted bid when a trailing invalid character is present. */
+    memcpy(oversized_bid, "R001|A001|", 10U);
+    memset(oversized_bid + 10U, '0', 57U);
+    memcpy(oversized_bid + 67U, "100000x", 8U);
+    CHECK(send_request(socket_fd, MSG_PLACE_BID, 30U, oversized_bid));
+    CHECK(receive_response(socket_fd, 30U, MSG_BID_RESULT, response));
+    CHECK(strcmp(response, "FAIL|INVALID_AMOUNT") == 0);
+    CHECK(send_request(socket_fd, MSG_PLACE_BID, 31U, "R001|A001| 100000"));
+    CHECK(receive_response(socket_fd, 31U, MSG_BID_RESULT, response));
+    CHECK(strcmp(response, "FAIL|INVALID_AMOUNT") == 0);
+    CHECK(send_request(socket_fd, MSG_PLACE_BID, 32U, "R001|A001|+100000"));
+    CHECK(receive_response(socket_fd, 32U, MSG_BID_RESULT, response));
+    CHECK(strcmp(response, "FAIL|INVALID_AMOUNT") == 0);
 
     CHECK(send_request(socket_fd, MSG_PLACE_BID, 22U,
                        "R001|A001|100000"));
@@ -320,6 +360,11 @@ int main(void)
     CHECK(strcmp(response, "OK|R001|100000") == 0);
     CHECK(receive_push(socket_fd, response));
     CHECK(strcmp(response, "R001|A001|100000|P001") == 0);
+    CHECK(send_request(socket_fd, MSG_GET_AUCTION_STATE, 106U, "R001"));
+    CHECK(receive_response(socket_fd, 106U, MSG_AUCTION_STATE, response));
+    CHECK(strncmp(response, "R001|A001|RUNNING|100000|P001|",
+                  strlen("R001|A001|RUNNING|100000|P001|")) == 0);
+    CHECK(strstr(response, "|100000|10000|1") != NULL);
 
     CHECK(send_request(socket_fd, MSG_PLACE_BID, 23U,
                        "R001|A001|109999"));
@@ -348,11 +393,21 @@ int main(void)
     CHECK(second_socket >= 0);
     CHECK(send_request(second_socket, MSG_CONNECT, 16U, "Bob"));
     CHECK(receive_response(second_socket, 16U, MSG_CONNECT_RESULT, response));
+    CHECK(send_request(second_socket, MSG_GET_AUCTION_STATE, 107U, "R001"));
+    CHECK(receive_response(second_socket, 107U, MSG_ERROR, response));
+    CHECK(strcmp(response, "NOT_IN_ROOM") == 0);
     CHECK(send_request(second_socket, MSG_JOIN_ROOM, 17U, "R001"));
     CHECK(receive_response(second_socket, 17U, MSG_JOIN_RESULT, response));
     CHECK(strcmp(response, "OK|R001") == 0);
     CHECK(receive_response(second_socket, 17U, MSG_ROOM_STATE, response));
     CHECK(strstr(response, "P002") != NULL);
+    /* A late joiner receives an authoritative snapshot of the G6 bid state,
+       instead of waiting for the next BID_UPDATE. */
+    CHECK(send_request(second_socket, MSG_GET_AUCTION_STATE, 108U, "R001"));
+    CHECK(receive_response(second_socket, 108U, MSG_AUCTION_STATE, response));
+    CHECK(strncmp(response, "R001|A001|RUNNING|100000|P001|",
+                  strlen("R001|A001|RUNNING|100000|P001|")) == 0);
+    CHECK(strstr(response, "|100000|10000|1") != NULL);
 
     CHECK(send_request(second_socket, MSG_PLACE_BID, 24U,
                        "R001|A001|110000"));
@@ -379,6 +434,41 @@ int main(void)
     CHECK(receive_response(socket_fd, 21U, MSG_JOIN_RESULT, response));
     CHECK(strcmp(response, "FAIL|ALREADY_IN_ROOM") == 0);
 
+    /* G3 reconnect restores the G5 room membership and exposes the matching
+       G6/G7 snapshot to the replacement client. */
+    (void)close(socket_fd);
+    socket_fd = connect_to_server(test_port, server_process);
+    CHECK(socket_fd >= 0);
+    CHECK(send_request(socket_fd, MSG_RECONNECT, 109U, reconnect_payload));
+    CHECK(receive_response(socket_fd, 109U, MSG_RECONNECT_RESULT, response));
+    CHECK(send_request(socket_fd, MSG_GET_SESSION_STATE, 110U, NULL));
+    CHECK(receive_response(socket_fd, 110U, MSG_SESSION_STATE, response));
+    CHECK(strcmp(response, "OK|R002") == 0);
+    CHECK(send_request(socket_fd, MSG_GET_AUCTION_STATE, 111U, "R002"));
+    CHECK(receive_response(socket_fd, 111U, MSG_AUCTION_STATE, response));
+    CHECK(strncmp(response, "R002|A001|RUNNING|0|-1|",
+                  strlen("R002|A001|RUNNING|0|-1|")) == 0);
+    CHECK(strstr(response, "|100000|10000|0") != NULL);
+
+    /* A valid token takes over a still-open/half-open session; an invalid
+       token never gets that privilege. */
+    takeover_socket = connect_to_server(test_port, server_process);
+    CHECK(takeover_socket >= 0);
+    CHECK(send_request(takeover_socket, MSG_RECONNECT, 112U,
+                       "P001|invalid-token"));
+    CHECK(receive_response(takeover_socket, 112U, MSG_ERROR, response));
+    CHECK(strcmp(response, "INVALID_RECONNECT") == 0);
+    CHECK(send_request(takeover_socket, MSG_RECONNECT, 113U,
+                       reconnect_payload));
+    CHECK(receive_response(takeover_socket, 113U,
+                           MSG_RECONNECT_RESULT, response));
+    CHECK(send_request(takeover_socket, MSG_GET_SESSION_STATE, 114U, NULL));
+    CHECK(receive_response(takeover_socket, 114U, MSG_SESSION_STATE, response));
+    CHECK(strcmp(response, "OK|R002") == 0);
+    (void)close(socket_fd);
+    socket_fd = takeover_socket;
+    takeover_socket = -1;
+
     exit_status = EXIT_SUCCESS;
 
 cleanup:
@@ -390,6 +480,9 @@ cleanup:
     }
     if (third_socket >= 0) {
         (void)close(third_socket);
+    }
+    if (takeover_socket >= 0) {
+        (void)close(takeover_socket);
     }
     if (server_process > 0) {
         (void)kill(server_process, SIGTERM);

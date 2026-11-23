@@ -3,7 +3,7 @@ CPPFLAGS = -D_POSIX_C_SOURCE=200809L
 CFLAGS = -Wall -Wextra -Wpedantic -std=c11
 
 TARGETS = server client
-TEST_TARGETS = tests/test_protocol tests/test_auction_state tests/test_server_integration
+TEST_TARGETS = tests/test_protocol tests/test_auction_state tests/test_server_integration tests/test_timer tests/test_server_timer tests/test_logger
 
 .PHONY: all clean test
 
@@ -24,10 +24,22 @@ tests/test_auction_state: tests/test_auction_state.c auction_state.c auction_sta
 tests/test_server_integration: tests/test_server_integration.c protocol.c protocol.h auction_state.h common.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -I. -o $@ tests/test_server_integration.c protocol.c
 
+tests/test_timer: tests/test_timer.c auction.c auction.h auction_state.c auction_state.h common.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -I. -o $@ tests/test_timer.c auction.c auction_state.c
+
+tests/test_server_timer: tests/test_server_timer.c protocol.c protocol.h common.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -I. -o $@ tests/test_server_timer.c protocol.c
+
+tests/test_logger: tests/test_logger.c logger.c logger.h protocol.h common.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -I. -o $@ tests/test_logger.c logger.c
+
 test: server $(TEST_TARGETS)
 	./tests/test_protocol
 	./tests/test_auction_state
 	./tests/test_server_integration
+	./tests/test_timer
+	./tests/test_server_timer
+	./tests/test_logger
 
 clean:
 	$(RM) $(TARGETS) $(TEST_TARGETS)

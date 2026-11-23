@@ -33,6 +33,7 @@ static void test_connect_disconnect_and_reconnect(void)
 
     assert(participant_reconnect(&state, alice_id, alice_token, &reconnected) ==
            STATE_ALREADY_CONNECTED);
+    assert(reconnected == alice);
 
     participant_disconnect(alice);
     assert(!alice->connected);
